@@ -1,10 +1,10 @@
-```apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: pod-no-privileged-binding
-spec:
-  policyName: pod-no-privileged
-  validationActions: ["Deny"]   # start with ["Warn","Audit"] for dry run
-  paramRef:
-    name: global-exception-registry
-    parameterNotFoundAction: Deny```
+```exceptions:
+  - id: EX-CLR-001
+    ticket: ARCHER-123456
+    ends: 2025-11-30T23:59:59Z
+    rules: ["noPrivileged"]
+    namespace: dft-clearing-sys-01
+    selector:
+      kinds: ["Pod"]
+      labels: { app: "legacy-ingestor" }
+    reason: "Vendor tool requires CAP_SYS_ADMIN during migration"```
