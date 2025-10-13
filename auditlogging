@@ -1,0 +1,181 @@
+Perfect 👍 — below is a final, production-ready Jira story/epic for your internal platform or observability backlog.
+It’s written in your team’s technical language (RKE2, Rancher, Splunk Otel, AWS infra) and ready for copy-paste into Jira.
+
+⸻
+
+🧭 Epic Title
+
+Implement Kubernetes Control-Plane Audit and Observability Framework for RKE2 Clusters
+
+⸻
+
+🎯 Epic Summary
+
+Establish a unified, security-compliant audit and observability framework for all Rancher RKE2 clusters running on AWS.
+This includes enabling and standardizing Kubernetes API server audit logging, collecting control-plane component logs (API Server, Controller Manager, Scheduler), forwarding data to Splunk Otel Collector, and ensuring proper retention, rotation, and correlation for security and operational visibility.
+
+⸻
+
+🧩 Goals / Objectives
+	1.	Full audit trail visibility — capture all authenticated Kubernetes API operations with actor, object, and decision metadata.
+	2.	Control-plane log centralization — consolidate logs from kube-apiserver, kube-controller-manager, and kube-scheduler.
+	3.	Compliance alignment — meet internal security and auditability requirements (CIS-Kubernetes, SOC2, ISO 27001).
+	4.	Operational assurance — ensure logs are durable, rotated, and searchable in Splunk for troubleshooting and forensics.
+
+⸻
+
+🧱 Scope of Work
+
+Area	Deliverable
+Audit Logging	Enable kube-apiserver audit logging with a hardened policy file and secure storage.
+Component Logs	Capture and stream control-plane logs from API Server, Controller Manager, and Scheduler.
+Splunk Otel Integration	Configure Otel Collector to collect both audit and component logs with consistent metadata.
+Retention & Rotation	Implement safe log rotation (maxage, maxbackup, maxsize) and validate disk usage.
+Access Control	Restrict read/write permissions on audit files and Splunk ingestion tokens.
+Validation & Dashboards	Verify ingestion in Splunk and create dashboards for API activity, RBAC changes, and scheduler decisions.
+
+
+⸻
+
+⚙️ Technical Implementation
+
+1️⃣ RKE2 Configuration (/etc/rancher/rke2/config.yaml)
+
+kube-apiserver-arg:
+  - audit-policy-file=/etc/rancher/rke2/audit-policy.yaml
+  - audit-log-path=/var/lib/rancher/rke2/server/logs/audit.log
+  - audit-log-maxage=14
+  - audit-log-maxbackup=10
+  - audit-log-maxsize=200
+  - v=2
+kube-controller-manager-arg:
+  - v=2
+kube-scheduler-arg:
+  - v=2
+
+2️⃣ Audit Policy (/etc/rancher/rke2/audit-policy.yaml)
+
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+
+rules:
+  - level: None
+    resources: [{group: "", resources: ["events"]}]
+
+  - level: Metadata
+    resources: [{group: "", resources: ["secrets"]}]
+
+  - level: RequestResponse
+    verbs: ["create","update","patch","delete","deletecollection"]
+    resources:
+      - {group: "", resources: ["pods","pods/exec","configmaps","persistentvolumeclaims","serviceaccounts"]}
+      - {group: "apps", resources: ["deployments","daemonsets","statefulsets","replicasets"]}
+      - {group: "rbac.authorization.k8s.io", resources: ["roles","rolebindings","clusterroles","clusterrolebindings"]}
+      - {group: "batch", resources: ["jobs","cronjobs"]}
+      - {group: "apiextensions.k8s.io", resources: ["customresourcedefinitions"]}
+
+  - level: Metadata
+    verbs: ["get","list","watch"]
+    resources:
+      - {group: "", resources: ["pods","configmaps","namespaces","nodes"]}
+      - {group: "apps", resources: ["deployments","daemonsets","statefulsets","replicasets"]}
+      - {group: "rbac.authorization.k8s.io", resources: ["roles","rolebindings","clusterroles","clusterrolebindings"]}
+      - {group: "batch", resources: ["jobs","cronjobs"]}
+
+  - level: Metadata
+
+3️⃣ Log Locations
+
+Component	Path	Description
+API Server / Auth	/var/log/containers/kube-apiserver-*_kube-system_*.log	Operational & auth logs
+Controller Manager	/var/log/containers/kube-controller-manager-*_kube-system_*.log	Reconciliation logs
+Scheduler	/var/log/containers/kube-scheduler-*_kube-system_*.log	Scheduling decisions
+Audit Logs	/var/lib/rancher/rke2/server/logs/audit.log	Structured API audit events
+
+
+⸻
+
+4️⃣ Splunk Otel Collector Configuration
+
+Append to existing values.yaml:
+
+logsEnabled: true
+clusterName: <cluster_name>
+
+agent:
+  collector:
+    logs:
+      additionalFilelogReceivers:
+        - include: "/var/lib/rancher/rke2/server/logs/audit.log"
+          attributes: {k8s.log_type: audit}
+        - include: "/var/log/containers/kube-apiserver-*_kube-system_*.log"
+          attributes: {k8s.log_type: apiserver}
+        - include: "/var/log/containers/kube-controller-manager-*_kube-system_*.log"
+          attributes: {k8s.log_type: controllerManager}
+        - include: "/var/log/containers/kube-scheduler-*_kube-system_*.log"
+          attributes: {k8s.log_type: scheduler}
+
+Deploy or update collector:
+
+helm upgrade --install splunk-otel-collector splunk-otel-collector/splunk-otel-collector \
+  -f values.yaml -n splunk-otel-collector --create-namespace
+
+
+⸻
+
+5️⃣ Security & Compliance
+	•	Restrict file permissions: only root and splunk-otel service account can read audit logs.
+	•	Enable encryption in transit (HTTPS / HEC) for Splunk ingestion.
+	•	Mask or redact sensitive fields during ingestion.
+	•	Rotate and archive logs according to data-retention policies.
+	•	Document ownership and access controls in cluster security baseline.
+
+⸻
+
+✅ Acceptance Criteria
+	1.	Audit policy active on all control-plane nodes.
+	2.	/var/lib/rancher/rke2/server/logs/audit.log exists and rotates correctly.
+	3.	Splunk indexes show four log categories: audit, apiserver, controllerManager, scheduler.
+	4.	Each API action (create, update, delete) generates a corresponding audit event with user identity, verb, resource, and result code.
+	5.	No sensitive data from Secrets or tokens appears in Splunk.
+	6.	Log ingestion latency < 1 minute.
+	7.	Disk usage and API server performance remain within baseline.
+	8.	Runbook created for enabling/disabling audit logging and verifying integrity.
+
+⸻
+
+🧰 Deliverables
+	•	RKE2 configuration updates and committed manifests.
+	•	Audit policy YAML (cluster-wide standard).
+	•	Updated Splunk Otel Collector Helm values.
+	•	Operational Runbook (“RKE2 Audit & Control-Plane Logging”).
+	•	Splunk dashboards:
+	•	Kubernetes API Activity Overview
+	•	RBAC Change Audit
+	•	Pod Lifecycle & Scheduling Timeline
+
+⸻
+
+📅 Effort Estimate
+
+Task	Owner	Effort
+Design & Review	Platform Engineering Lead	1 day
+RKE2 Config Deployment	SRE	1 day
+Otel Collector Update	Observability Team	0.5 day
+Validation & Dashboarding	SecOps	1 day
+
+
+⸻
+
+📘 References
+	•	Kubernetes Audit Logging
+	•	RKE2 Configuration Reference
+	•	Splunk Otel Collector for Kubernetes
+
+⸻
+
+🏁 Expected Outcome
+
+After completion, every RKE2 cluster will generate and forward structured audit and control-plane logs to Splunk Otel Collector.
+This provides end-to-end traceability of API operations, security-relevant actions, and control-plane events — enabling compliant auditing, proactive monitoring, and rapid forensic analysis across the Kubernetes platform.
