@@ -1,0 +1,316 @@
+Part A — Where the data can be exploited (threat surface, plain-English)
+
+These are all the ways sensitive data (PII) stored on an EBS-backed PVC can be exposed or misused.
+	1.	Another pod mounts the same PVC
+	•	A different application or test pod in the same namespace or elsewhere mounts the PVC and reads/writes the data.
+	2.	Multiple pods on the same node read the disk
+	•	Even with one node attached (EBS RWO), multiple pods on that node can access the mounted filesystem.
+	3.	kubectl exec / kubectl cp / kubectl attach
+	•	An operator or attacker opens a shell or copies files from the running container and pulls data out.
+	4.	Privileged pods, DaemonSets, hostPath access
+	•	A privileged/hostPath pod could read the kubelet’s host filesystem and access the volume data.
+	5.	Node compromise
+	•	If an attacker controls the node (SSH, container escape), they can read the decrypted block device.
+	6.	Container escape / runtime compromise
+	•	Vulnerable container code or an exploit lets an attacker break out of the container and access host devices or other containers’ files.
+	7.	Snapshots and backups
+	•	EBS snapshots or cluster backups may be created and then copied or shared (accidentally or maliciously) to other accounts or made public.
+	8.	KMS key misuse
+	•	Overly-broad KMS key policies let unintended principals decrypt the volume or copy snapshots to an account that can decrypt them.
+	9.	CI/CD and automation mistakes
+	•	Deploy pipelines, backup jobs or restore scripts copy sensitive data to test environments or cloud storage incorrectly.
+	10.	Logs, metrics, and monitoring
+	•	Applications print PII to stdout, write secrets into logs, or metric traces contain identifiers.
+	11.	Secrets leakage
+	•	Credentials, keys, or tokens used by the app (in Secrets or environment variables) are exposed or accessible to others.
+	12.	Image supply-chain / malicious images
+	•	A compromised container image includes exfiltration logic or a backdoor.
+	13.	Network exfiltration
+	•	The application or an attacker sends PII to an external endpoint (internet or other accounts) via outbound network flows.
+	14.	Improper RBAC / cluster admin actions
+	•	Users with cluster privileges can attach/detach volumes, create snapshots, or access pod data.
+	15.	CSI & snapshot controller risks
+	•	CSI drivers, snapshot controllers, or operator permissions can create snapshots or clone volumes without proper controls.
+	16.	Human error
+	•	Mistakes like wrong Helm values, misapplied manifests, or forgetting to enable encryption can leak data.
+
+⸻
+
+Part B — Solutions: defense-in-depth (layered controls, concrete and implementable)
+
+We mitigate every exploitation path above by composing controls across layers: Kubernetes, storage/AWS, runtime/OS, supply chain, networking, audit/detection, and operations. I first give the plain control name + short explanation, then concrete details and (where relevant) Gatekeeper design notes.
+
+Design principles used:
+	•	Least privilege (limit who/what can access)
+	•	Defense in depth (multiple controls so one failure isn’t catastrophic)
+	•	Auditability (everything sensitive is logged)
+	•	Fail closed for PII (deny by default; allow exceptions with tickets)
+
+⸻
+
+1 — Prevent other pods from mounting the PVC (Kubernetes enforcement)
+
+Goal: Only the intended application (service account) can mount pii-pvc.
+
+Controls
+	•	Gatekeeper Constraint (recommended): enforce that pods referencing PVC pii-pvc must run as pii-writer-sa and carry a specific label (e.g. security.yourorg.io/pii=true).
+	•	Why Gatekeeper: it can look up the Pod spec and deny create/update on pods that attempt to mount the PVC with any other SA.
+	•	Admission policy fallback (VAP): if you cannot run Gatekeeper for some reason, use VAP to deny pod specs that mount pii-pvc unless they use the SA — works for pod create/update but has limits on subresources.
+	•	RBAC: remove PVC/PV create/modify verbs from broad dev roles; only platform/service accounts and a narrow team can operate storage.
+
+Implementation notes (Gatekeeper)
+	•	Create a ConstraintTemplate that finds spec.volumes[*].persistentVolumeClaim.claimName == "pii-pvc"; if matched, require spec.serviceAccountName == "pii-writer-sa" and metadata.labels["security.yourorg.io/pii"] == "true".
+	•	Also optionally require securityContext.fsGroup to a reserved GID used by the PII app to prevent other pods from reusing a privileged fsGroup.
+
+⸻
+
+2 — Prevent kubectl exec, attach, port-forward into PII pods
+
+Goal: Block interactive access to pods that hold PII, but let regular pods be debugged normally.
+
+Controls
+	•	Gatekeeper policy (per-pod): when a subresource request (pods/exec, pods/attach, pods/portforward) targets a pod labeled security.yourorg.io/exec-protected=true OR whose image matches the protected image(s), deny the request unless the caller belongs to the SRE break-glass group (e.g., oncall-sre@yourorg).
+	•	RBAC narrow role (break-glass): create a ClusterRole that only grants pods/exec|attach|portforward and bind it to the on-call SRE OIDC group — do not assign these verbs to developer roles.
+	•	Audit & alert: ensure audit logs capture every exec attempt and send alerts for denied/allowed attempts into SIEM.
+
+Implementation notes (Gatekeeper)
+	•	Gatekeeper’s Rego can query the Kubernetes inventory to retrieve the target pod and examine spec.containers[*].image or metadata.labels before deciding.
+	•	Use enforcementAction: dryrun initially to see violations.
+
+⸻
+
+3 — Prevent privileged host access and hostPath exposure
+
+Goal: Prevent any pod from reading host files to reach the PVC contents or kubelet directories.
+
+Controls
+	•	Gatekeeper Constraint: deny creation of pods with hostPath mounts, hostPID, hostNetwork, or privileged: true unless specifically allowed to a tiny ops role.
+	•	Pod Security Admission (PSA) / Pod Security Standards: enforce restricted at the namespace or cluster level.
+	•	DaemonSet/privileged review: whitelist and review DaemonSets (e.g., logging, monitoring) to ensure they don’t have hostPath/pod-level escalations that could read volumes.
+
+⸻
+
+4 — Protect against node compromise (reduce blast radius)
+
+Goal: If a node is compromised, make data still difficult to exfiltrate.
+
+Controls
+	•	Dedicated KMS key (CMK) for PII volumes with tight key policy:
+	•	Allow kms:Decrypt only to the EC2 instance profile(s) / CSI driver principal(s) that you explicitly trust.
+	•	Deny cross-account grants and public sharing.
+	•	Prefer pod-level IAM (IRSA) for access to other AWS services, but remember EBS decryption is performed by node/driver, not pod — so key policy must be keyed to node/driver principals.
+	•	Node hardening: minimal OS, minimal ssh access, disable unnecessary tooling, regularly patched images.
+	•	Kernel-level protections: enable SELinux or AppArmor and disable Docker-in-Docker patterns.
+
+⸻
+
+5 — Storage-level controls: EBS, StorageClass, snapshots
+
+Goal: Prevent volume reuse outside allowed scope; encrypt and lock snapshots.
+
+Controls
+	•	StorageClass set encrypted: "true" and kmsKeyId: <CMK ARN>; prefer volumeBindingMode: WaitForFirstConsumer.
+	•	Access mode: EBS is ReadWriteOnce (RWO) — good, because only one node attaches, but remember pods on that node can share it — policy must prevent those pods.
+	•	Snapshot policy: restrict snapshot creation (who/what can snapshot) via IAM/backup tool roles; block public or cross-account sharing via IAM or preventive guardrails (AWS Config/SCP).
+	•	Backup tooling: ensure Velero/backups use the CMK and are not exposing snapshots to other accounts or buckets.
+
+⸻
+
+6 — App & container hardening
+
+Goal: Make it hard for a container to be used for exfiltration or escape.
+
+Controls
+	•	SecurityContext: runAsNonRoot: true, runAsUser, runAsGroup, fsGroup, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false.
+	•	Drop capabilities: capabilities: drop: ["ALL"].
+	•	seccompProfile: RuntimeDefault or a restrictive policy.
+	•	Restrict filesystem permissions: use fsGroup and fsGroupChangePolicy to limit access.
+	•	AutomountServiceAccountToken: false for the app Pod if it doesn’t need the token.
+
+⸻
+
+7 — Image & supply-chain security
+
+Goal: Prevent malicious or vulnerable images from being used.
+
+Controls
+	•	Image signing & verification: require signed images (cosign) and enforce with Gatekeeper (or an admission webhook).
+	•	Image provenance: restrict allowed registries, require digest pinning (image@sha256:…), and use a private registry mirror if possible.
+	•	Vulnerability scanning & SBOM: build/scan images and attach an SBOM; prevent images with critical CVEs from being deployed.
+
+⸻
+
+8 — Network controls (prevent exfiltration)
+
+Goal: Limit the app’s outbound targets and only allow necessary ingress.
+
+Controls
+	•	NetworkPolicy default-deny for pods; allow only:
+	•	Ingress from known services (e.g., app → DB)
+	•	Egress to allowed backup or auth endpoints (Vault/KMS endpoints)
+	•	Egress proxy / firewall: funnel outbound traffic through a proxy that logs and inspects outbound connections; block unknown external exfil endpoints.
+	•	DNS controls: restrict DNS to internal resolvers and allow-lists.
+
+⸻
+
+9 — Secrets & keys management
+
+Goal: Avoid leaking credentials and reduce attack surface.
+
+Controls
+	•	Vault / external secret manager: keep encryption keys and app secrets out of K8s Secrets. If Secrets are used, store them encrypted (SealedSecrets / SOPS) and minimize read permissions.
+	•	Least privilege IAM: service roles only allow what the app needs.
+	•	Short-lived credentials: prefer tokens/STS, not long-lived keys.
+
+⸻
+
+10 — CSI driver & snapshot controller hardening
+
+Goal: Prevent CSI components from being abused to make snapshots or clones.
+
+Controls
+	•	Limit who can create VolumeSnapshot resources with Gatekeeper and RBAC.
+	•	Ensure the CSI controller runs with least privileges and that snapshot IAM roles are tightly scoped.
+	•	Audit snapshot creation and copying.
+
+⸻
+
+11 — Audit logging, detection, and alerting
+
+Goal: Make every sensitive action visible and trigger alarms.
+
+Controls
+	•	Enable Kubernetes audit logging (control plane) with policy that logs:
+	•	pods/exec, pods/attach, pods/portforward at RequestResponse
+	•	persistentvolumeclaims, persistentvolumes create/update at RequestResponse
+	•	RBAC changes at RequestResponse
+	•	Secrets: Metadata (not request/response bodies)
+	•	Forward audit logs to Splunk OTEL and index useful fields (user.username, verb, objectRef, responseStatus, sourceIPs).
+	•	Runtime detection: run Falco or Sysdig with rules for:
+	•	Non-authorized process reading /mnt/pii or the mount path
+	•	Any kubectl exec into protected pods
+	•	New containers run as root or with suspicious capabilities
+	•	CloudTrail & KMS logs: monitor CreateSnapshot, CopySnapshot, ModifySnapshotAttribute, and kms:Decrypt calls.
+
+⸻
+
+12 — Operational controls and break-glass
+
+Goal: Allow controlled and auditable debugging when absolutely needed.
+
+Controls
+	•	Break-glass ClusterRole: a role granting only pods/exec|attach|portforward and nothing else; bind via OIDC group to on-call SREs.
+	•	Gatekeeper exception: allow the oncall group to bypass exec-deny for protected pods (Gatekeeper checks group membership).
+	•	Time-limited access: perform group membership changes via ticket automation (e.g., add user to oncall group for 1 hour).
+	•	Audit & ticket: every break-glass use must have a ticket/Archer ID logged and recorded in the SIEM event.
+
+⸻
+
+13 — Incident response & forensics
+
+Goal: If PII exposure occurs, respond quickly and gather evidence.
+
+Controls & Steps
+	1.	Isolate: remove RBAC bindings, restrict network, cordon node if needed.
+	2.	Snapshot for forensics: create encrypted snapshot for analysis (do not share).
+	3.	Collect artifacts: pod YAMLs, image digests, logs, kube-apiserver audit events, CloudTrail and KMS logs, node process list.
+	4.	Rotate keys: rotate KMS or app encryption keys if exposure confirmed.
+	5.	Notify: follow legal and regulatory notification process.
+	6.	Remediate: patch vulnerabilities, revoke credentials, re-deploy with fixes.
+
+⸻
+
+Part C — Concrete Gatekeeper policy motifs (what to implement first)
+
+Below are three essential Gatekeeper components you should implement. (I summarized the Rego logic earlier; here’s the short checklist + example intent.)
+	1.	PVC exclusivity constraint
+	•	Match: Pod
+	•	Rule: Deny pod if it mounts claimName pii-pvc and spec.serviceAccountName != "pii-writer-sa".
+	2.	Exec deny on protected pods
+	•	Match: Subresources Pod/exec, Pod/attach, Pod/portforward
+	•	Rule: Lookup target Pod; if pod.metadata.labels["security.yourorg.io/exec-protected"]=="true" OR any container image in pod starts with registry.example.com/platform/pii-writer:, deny unless user is in oncall-sre@company.com.
+	3.	Pod hardening
+	•	Match: Pod
+	•	Rule: Require securityContext/container securityContext constraints (runAsNonRoot, allowPrivilegeEscalation=false, drop capabilities, seccomp RuntimeDefault, readOnlyRootFilesystem true where possible).
+
+Gatekeeper gives you audit/dryrun vs enforce modes — use dryrun initially.
+
+⸻
+
+Part D — Testing & validation (detailed)
+
+Test every control with scripted checks:
+	1.	PVC mount negative test
+	•	Try to create a Pod as dev-sa mounting pii-pvc → expect Gatekeeper deny.
+	2.	Exec deny test
+	•	Label PII pod exec-protected=true. From non-SRE user run kubectl exec → expect denial; from oncall-sre expect allow (if allowed).
+	3.	Privileged hostPath denial
+	•	Try to deploy privileged DaemonSet with hostPath → expect denial (unless whitelisted).
+	4.	Snapshot & KMS test
+	•	Attempt snapshot copy with a user not in the KMS key policy → expect KMS AccessDenied.
+	5.	Node compromise simulation (lab)
+	•	On a test node, try to read /var/lib/kubelet/pods/.../volumes/... as non-root → ensure it’s blocked by node hardening or that data is encrypted / unreadable without keys.
+	6.	Audit ingestion test
+	•	Perform kubectl exec and verify corresponding audit event in Splunk within expected latency. Confirm fields are parsed and alerts trigger.
+	7.	Runtime detection test
+	•	Trigger a Falco rule (simulate an exec into protected pod) and verify alerting pipeline.
+
+⸻
+
+Part E — Runbook snippet (break-glass & incident)
+
+Break-glass (one-time debug):
+	1.	Create ticket with justification & Archer ID.
+	2.	Add user to oncall-sre OIDC group (automated via SSO if possible) for N hours.
+	3.	User performs kubectl exec with recorded timestamp. All actions are audited.
+	4.	Remove user from group automatically when time expires. Attach audit log to ticket.
+
+If you suspect exfiltration:
+	1.	Immediately remove the pod or rollback to an image without issue.
+	2.	Revoke or rotate credentials used by the app (Vault keys, KMS access if needed).
+	3.	Capture forensic snapshot and collect logs.
+	4.	Run the incident response checklist and notify legal if required.
+
+⸻
+
+Part F — Prioritized rollout (practical path)
+
+Phase 0 — Preparation
+	•	Define naming/labeling conventions (PVC name, SA name, label keys).
+	•	Create CMK and StorageClass (but don’t switch volumes yet).
+	•	Install Gatekeeper, enable Pod/Namespace sync.
+
+Phase 1 — Soft enforcement (low risk)
+	•	Deploy Gatekeeper constraints in enforcementAction: dryrun. Monitor violations for 1–2 weeks and fix apps.
+
+Phase 2 — Enforce PVC exclusivity
+	•	Enforce Gatekeeper policy that blocks non-SA mounts for pii-pvc. Update deployments to match SA.
+
+Phase 3 — Enforce exec-deny on protected pods
+	•	Enforce Gatekeeper exec restrictions. Ensure oncall-sre works for emergency access.
+
+Phase 4 — Storage & key hardening
+	•	Switch StorageClass to use CMK; migrate/resize volumes carefully; ensure KMS policy is restrictive.
+
+Phase 5 — Runtime & network
+	•	Deploy Falco/Sysdig rules; implement NetworkPolicies and egress proxy.
+
+Phase 6 — Audit & compliance
+	•	Tune audit-policy, ship to Splunk, create dashboards and alerts.
+
+⸻
+
+Part G — Final checklist (quick reference)
+	•	Gatekeeper installed and configured (Pod/Namespace sync)
+	•	Gatekeeper Constraint: PVC exclusivity (pii-pvc → pii-writer-sa)
+	•	Gatekeeper Constraint: Exec/attach/portforward deny for protected pods (label/Image)
+	•	Gatekeeper Constraint: Pod hardening enforced
+	•	StorageClass uses dedicated KMS CMK; key policy restricted
+	•	RBAC: remove exec from normal roles; create break-glass role bound to SRE OIDC group
+	•	NetworkPolicy default deny for PII pod
+	•	Secrets in Vault or encrypted, not plain K8s Secrets
+	•	Image signing & vulnerability scanning enabled
+	•	Kubernetes audit logging enabled and ingested to Splunk
+	•	Runtime detection (Falco/Sysdig) rules deployed
+	•	Backup/snapshot controls with KMS encryption and no cross-account sharing
+	•	Incident response runbook and automated break-glass workflow
