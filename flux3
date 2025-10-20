@@ -1,0 +1,498 @@
+⸻
+
+📁 Chart layout
+
+charts/infra/
+  Chart.yaml
+  values.yaml
+  templates/
+    _helpers.tpl
+    ns.yaml                 # (optional) create the app namespace
+    aws/
+      s3/
+        buckets.yaml
+        features.yaml
+        policies.yaml
+      iam/
+        roles.yaml
+        policies.yaml
+        attachments.yaml
+      kms/
+        keys.yaml
+        aliases.yaml
+
+
+⸻
+
+Chart.yaml
+
+apiVersion: v2
+name: infra
+description: Per-namespace ACK resources (S3, IAM, KMS)
+type: application
+version: 0.2.0
+appVersion: "1.0.0"
+
+
+⸻
+
+values.yaml (minimal + naming helpers)
+
+# The namespace where ACK CRs will be created for THIS release
+# Defaults to the Helm release namespace
+targetNamespace: ""
+
+# Optionally create the target namespace
+createNamespace: true
+
+# Global naming options to avoid cross-namespace AWS name collisions
+naming:
+  # If true, and if an item doesn't specify an AWS name, we derive one from:
+  # <k8s-namespace>-<id>[-<account>]
+  deriveFromNamespace: true
+  accountSuffix: ""     # e.g., "123456789012" (optional)
+
+aws:
+  s3:
+    buckets: []
+    # - id: logs
+    #   # k8sName: s3-logs                    # optional (defaults: s3-<id>)
+    #   # name: myorg-logs-123456789012       # explicit AWS bucket name; if omitted and deriveFromNamespace=true, it will be computed
+    #   region: us-east-1
+    #   publicAccessBlock: true
+    #   versioning: true
+    #   encryption:
+    #     algorithm: aws:kms
+    #     kmsKeyArn: arn:aws:kms:us-east-1:123456789012:key/abcd...
+    #   lifecycleRules: []
+    #   policyJson: |                         # optional JSON policy
+    #     { "Version":"2012-10-17","Statement":[ ... ] }
+    #   tags: { app: "", owner: "" }
+
+  iam:
+    roles: []
+    # - id: app-irsa
+    #   # name: app-irsa                      # explicit AWS role name; if omitted + deriveFromNamespace=true -> <ns>-<id>
+    #   assumeRolePolicyDocument: |
+    #     { "Version":"2012-10-17","Statement":[ ... ] }
+    #   managedPolicyArns:
+    #     - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+    #   inlinePolicies:
+    #     - name: allow-s3-read
+    #       document: |
+    #         { "Version":"2012-10-17","Statement":[ ... ] }
+    #   tags: { app: "", env: "" }
+
+    policies: []
+    # - id: custom-s3-read
+    #   # name: custom-s3-read
+    #   policyDocument: |
+    #     { "Version":"2012-10-17","Statement":[ ... ] }
+
+    attachments: []
+    # - roleId: app-irsa
+    #   policyArn: arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  kms:
+    keys: []
+    # - id: app-data
+    #   # name is k8s name; AWS key gets its own id from AWS; alias controls friendly reference
+    #   description: "App data CMK"
+    #   keySpec: SYMMETRIC_DEFAULT
+    #   keyUsage: ENCRYPT_DECRYPT
+    #   multiRegion: false
+    #   policy: |
+    #     { "Version":"2012-10-17","Statement":[ ... ] }
+    #   tags: { app: "", env: "" }
+    aliases: []
+    # - id: app-data
+    #   name: alias/app-data
+    #   targetKeyIdRef: app-data
+
+
+⸻
+
+templates/_helpers.tpl
+
+{{/*
+Resolve the namespace where ACK CRs will be created.
+Defaults to the Helm release namespace.
+*/}}
+{{- define "ack.ns" -}}
+{{- if .Values.targetNamespace -}}
+{{ .Values.targetNamespace }}
+{{- else -}}
+{{ .Release.Namespace }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Safe K8s name (DNS-1123)
+*/}}
+{{- define "safeName" -}}
+{{- regexReplaceAll "[^a-z0-9-]" (lower .) "-" | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Compute AWS resource names when not explicitly provided.
+For S3/IAM names, if naming.deriveFromNamespace=true and .awsName is empty:
+  <k8s-namespace>-<id>[-<accountSuffix>]
+*/}}
+{{- define "aws.name.orDerived" -}}
+{{- $ns := include "ack.ns" .root -}}
+{{- $id := .id -}}
+{{- $provided := .awsName -}}
+{{- $derive := .root.Values.naming.deriveFromNamespace | default false -}}
+{{- $acct := .root.Values.naming.accountSuffix | default "" -}}
+{{- if $provided -}}
+{{ $provided }}
+{{- else if $derive -}}
+{{- if $acct | ne "" -}}
+{{ printf "%s-%s-%s" $ns $id $acct }}
+{{- else -}}
+{{ printf "%s-%s" $ns $id }}
+{{- end -}}
+{{- else -}}
+{{- /* fallback to id if user disabled derivation */ -}}
+{{ $id }}
+{{- end -}}
+{{- end -}}
+
+
+⸻
+
+templates/ns.yaml (optional)
+
+{{- if .Values.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "ack.ns" . }}
+{{- end }}
+
+
+⸻
+
+S3
+
+templates/aws/s3/buckets.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $b := .Values.aws.s3.buckets }}
+{{- $k8sName := default (printf "s3-%s" $b.id) $b.k8sName | include "safeName" -}}
+{{- $awsName := include "aws.name.orDerived" (dict "root" $ "id" $b.id "awsName" $b.name) -}}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: Bucket
+metadata:
+  name: {{ $k8sName }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ required (printf "aws.s3.buckets[%s].name missing and can't be derived" $b.id) $awsName }}
+  {{- if $b.region }}
+  createBucketConfiguration: { locationConstraint: {{ $b.region }} }
+  {{- end }}
+  {{- if $b.tags }}
+  tags:
+  {{- range $k, $v := $b.tags }}
+    - key: {{ $k | quote }}
+      value: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}
+
+templates/aws/s3/features.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $b := .Values.aws.s3.buckets }}
+{{- $k8sName := default (printf "s3-%s" $b.id) $b.k8sName | include "safeName" -}}
+{{- if $b.publicAccessBlock }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: PublicAccessBlock
+metadata:
+  name: {{ $k8sName }}-pab
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $k8sName }} } }
+  blockPublicAcls: true
+  blockPublicPolicy: true
+  ignorePublicAcls: true
+  restrictPublicBuckets: true
+{{- end }}
+
+{{- if $b.versioning }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketVersioning
+metadata:
+  name: {{ $k8sName }}-ver
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $k8sName }} } }
+  status: Enabled
+{{- end }}
+
+{{- if $b.encryption }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketEncryption
+metadata:
+  name: {{ $k8sName }}-enc
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $k8sName }} } }
+  rules:
+    - applyServerSideEncryptionByDefault:
+        sseAlgorithm: {{ default "aws:kms" $b.encryption.algorithm }}
+        {{- if $b.encryption.kmsKeyArn }}
+        kmsMasterKeyID: {{ $b.encryption.kmsKeyArn }}
+        {{- end }}
+      bucketKeyEnabled: true
+{{- end }}
+
+{{- if $b.lifecycleRules }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketLifecycleConfiguration
+metadata:
+  name: {{ $k8sName }}-lc
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $k8sName }} } }
+  rules:
+{{ toYaml $b.lifecycleRules | nindent 4 }}
+{{- end }}
+{{- end }}
+
+templates/aws/s3/policies.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $b := .Values.aws.s3.buckets }}
+{{- if $b.policyJson }}
+{{- $k8sName := default (printf "s3-%s" $b.id) $b.k8sName | include "safeName" -}}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketPolicy
+metadata:
+  name: {{ printf "%s-policy" $k8sName | include "safeName" }}
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $k8sName }} } }
+  policy: |
+{{ $b.policyJson | nindent 4 }}
+{{- end }}
+{{- end }}
+
+
+⸻
+
+IAM
+
+templates/aws/iam/roles.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $r := .Values.aws.iam.roles }}
+{{- $awsRoleName := include "aws.name.orDerived" (dict "root" $ "id" $r.id "awsName" $r.name) -}}
+{{- $k8sRoleName := include "safeName" (default $r.id $r.name) -}}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Role
+metadata:
+  name: {{ $k8sRoleName }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ $awsRoleName }}
+  {{- if $r.tags }}
+  tags:
+  {{- range $k, $v := $r.tags }}
+    - key: {{ $k | quote }}
+      value: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+  assumeRolePolicyDocument: |
+{{ required (printf "aws.iam.roles[%s].assumeRolePolicyDocument is required" $r.id) $r.assumeRolePolicyDocument | nindent 4 }}
+
+{{- if $r.inlinePolicies }}
+{{- range $_, $p := $r.inlinePolicies }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ include "safeName" (printf "%s-%s" $k8sRoleName $p.name) }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ printf "%s-%s" $awsRoleName $p.name | trunc 128 | trimSuffix "-" }}
+  policyDocument: |
+{{ $p.document | nindent 4 }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: RolePolicyAttachment
+metadata:
+  name: {{ include "safeName" (printf "%s-%s-attach" $k8sRoleName $p.name) }}
+  namespace: {{ $ns }}
+spec:
+  policyRef: { from: { name: {{ include "safeName" (printf "%s-%s" $k8sRoleName $p.name) }} } }
+  roleRef:   { from: { name: {{ $k8sRoleName }} } }
+{{- end }}
+{{- end }}
+
+{{- if $r.managedPolicyArns }}
+{{- range $i, $arn := $r.managedPolicyArns }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: RolePolicyAttachment
+metadata:
+  name: {{ include "safeName" (printf "%s-mpa-%d" $k8sRoleName $i) }}
+  namespace: {{ $ns }}
+spec:
+  policyARN: {{ $arn | quote }}
+  roleRef:   { from: { name: {{ $k8sRoleName }} } }
+{{- end }}
+{{- end }}
+{{- end }}
+
+templates/aws/iam/policies.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $p := .Values.aws.iam.policies }}
+{{- $k8sName := include "safeName" (default $p.id $p.name) -}}
+{{- $awsName := default $p.name $p.id -}}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ $k8sName }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ $awsName }}
+  policyDocument: |
+{{ required (printf "aws.iam.policies[%s].policyDocument is required" $awsName) $p.policyDocument | nindent 4 }}
+{{- end }}
+
+templates/aws/iam/attachments.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $a := .Values.aws.iam.attachments }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: RolePolicyAttachment
+metadata:
+  name: {{ include "safeName" (printf "%s-ext-%d" $a.roleId $_) }}
+  namespace: {{ $ns }}
+spec:
+  policyARN: {{ required "aws.iam.attachments[].policyArn is required" $a.policyArn | quote }}
+  roleRef:   { from: { name: {{ include "safeName" (required "aws.iam.attachments[].roleId is required" $a.roleId) }} } }
+{{- end }}
+
+
+⸻
+
+KMS
+
+templates/aws/kms/keys.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $k := .Values.aws.kms.keys }}
+---
+apiVersion: kms.services.k8s.aws/v1alpha1
+kind: Key
+metadata:
+  name: {{ include "safeName" $k.id }}
+  namespace: {{ $ns }}
+spec:
+  description: {{ default "" $k.description | quote }}
+  keySpec:  {{ default "SYMMETRIC_DEFAULT" $k.keySpec }}
+  keyUsage: {{ default "ENCRYPT_DECRYPT" $k.keyUsage }}
+  multiRegion: {{ if $k.multiRegion }}true{{ else }}false{{ end }}
+  {{- if $k.tags }}
+  tags:
+  {{- range $k2, $v2 := $k.tags }}
+    - tagKey: {{ $k2 | quote }}
+      tagValue: {{ $v2 | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if $k.policy }}
+  policy: |
+{{ $k.policy | nindent 4 }}
+  {{- end }}
+{{- end }}
+
+templates/aws/kms/aliases.yaml
+
+{{- $ns := include "ack.ns" . -}}
+{{- range $_, $a := .Values.aws.kms.aliases }}
+---
+apiVersion: kms.services.k8s.aws/v1alpha1
+kind: Alias
+metadata:
+  name: {{ include "safeName" (default $a.id ($a.name | replace "alias/" "")) }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ required "aws.kms.aliases[].name (e.g., alias/app-data) is required" $a.name | quote }}
+  targetKeyRef: { from: { name: {{ include "safeName" (required "aws.kms.aliases[].targetKeyIdRef is required" $a.targetKeyIdRef) }} } }
+{{- end }}
+
+
+⸻
+
+💡 How you’ll use it per namespace (Flux Option 1)
+
+For each app namespace, you’ll have a tiny folder with:
+	•	namespace.yaml (creates the namespace),
+	•	values.yaml (only the list of buckets/roles/keys for that namespace),
+	•	helmrelease.yaml (targets that namespace).
+
+helmrelease.yaml
+
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: infra-billing-dev
+  namespace: flux-system
+spec:
+  interval: 10m
+  targetNamespace: billing-dev            # ✅ create ACK CRs IN THIS NAMESPACE
+  chart:
+    spec:
+      sourceRef: { kind: GitRepository, name: infra-repo, namespace: flux-system }
+      chart: charts/infra
+  valuesFrom:
+    - kind: ConfigMap
+      name: infra-billing-dev-values
+      valuesKey: values.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infra-billing-dev-values
+  namespace: flux-system
+data:
+  values.yaml: |
+    targetNamespace: billing-dev          # optional; defaults to .Release.Namespace
+    naming:
+      deriveFromNamespace: true
+      accountSuffix: "123456789012"
+    aws:
+      s3:
+        buckets:
+          - id: logs
+            # name omitted -> derived: billing-dev-logs-123456789012
+            region: us-east-1
+            publicAccessBlock: true
+            versioning: true
+      iam:
+        roles:
+          - id: app-irsa
+            assumeRolePolicyDocument: |
+              { "Version":"2012-10-17","Statement":[ ... ] }
+            managedPolicyArns:
+              - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      kms:
+        keys:
+          - id: app-data
+            description: "Billing CMK"
+        aliases:
+          - name: alias/billing-app-data
+            targetKeyIdRef: app-data
+
