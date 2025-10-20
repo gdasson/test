@@ -1,0 +1,502 @@
+Awesome—here’s a ready-to-use, generic Helm chart you can drop into your Flux repo that renders ACK resources for S3, IAM, and KMS. It supports lists (many buckets/roles/keys) and keeps structure simple so you can drive everything with per-env values.yaml.
+
+⸻
+
+📦 Chart layout
+
+charts/ack-infra/
+  Chart.yaml
+  values.yaml
+  templates/
+    _helpers.tpl
+    ns.yaml
+    s3-buckets.yaml
+    s3-bucket-features.yaml
+    iam-roles.yaml
+    iam-policies.yaml
+    iam-attachments.yaml
+    kms-keys.yaml
+    kms-aliases.yaml
+
+
+⸻
+
+Chart.yaml
+
+apiVersion: v2
+name: ack-infra
+description: Generic ACK infra (S3, IAM, KMS) driven by values lists
+type: application
+version: 0.1.0
+appVersion: "1.0"
+
+
+⸻
+
+values.yaml (schema & examples)
+
+# Target namespace where ACK controllers watch (common: ack-system)
+targetNamespace: ack-system
+
+# Optionally create it if it doesn't exist
+createNamespace: true
+
+# ---- S3 -------------------------------------------------------------
+s3:
+  buckets: []
+  # Example:
+  # - id: logs                                 # unique key inside your values
+  #   k8sName: s3-logs                         # k8s object name (defaults to "s3-<id>")
+  #   name: myorg-prod-logs-123456789012       # S3 bucket name (must be globally unique)
+  #   region: us-east-1
+  #   tags:
+  #     environment: prod
+  #     managed-by: ack
+  #   publicAccessBlock: true
+  #   versioning: true
+  #   encryption:
+  #     algorithm: aws:kms                      # or AES256
+  #     kmsKeyArn: arn:aws:kms:us-east-1:123456789012:key/abcd-...
+  #   lifecycleRules: []                        # direct pass-through of ACK rules
+  #   policyJson: ""                            # optional bucket policy (string JSON)
+
+# ---- IAM ------------------------------------------------------------
+iam:
+  roles: []
+  # Example:
+  # - id: app-irsa
+  #   name: app-irsa                            # optional; defaults to id
+  #   tags:
+  #     app: foo
+  #   assumeRolePolicyDocument: |               # JSON string
+  #     {
+  #       "Version": "2012-10-17",
+  #       "Statement": [ ... ]
+  #     }
+  #   inlinePolicies:
+  #     - name: allow-s3-read
+  #       document: |                           # JSON string
+  #         { "Version":"2012-10-17", "Statement":[ ... ] }
+  #   managedPolicyArns:
+  #     - arn:aws:iam::aws:policy/ReadOnlyAccess
+  policies: []
+  # - id: custom-s3-read
+  #   name: custom-s3-read
+  #   policyDocument: |                         # JSON string
+  #     { "Version":"2012-10-17", "Statement":[ ... ] }
+  attachments: []
+  # - roleId: app-irsa
+  #   policyArn: arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+# ---- KMS ------------------------------------------------------------
+kms:
+  keys: []
+  # - id: app-data
+  #   description: "App data key"
+  #   keySpec: SYMMETRIC_DEFAULT
+  #   keyUsage: ENCRYPT_DECRYPT
+  #   multiRegion: false
+  #   tags:
+  #     owner: platform
+  #   policy: |                                  # JSON string (optional)
+  #     { "Version":"2012-10-17","Statement":[ ... ] }
+  aliases: []
+  # - id: app-data
+  #   name: alias/app-data                       # alias name
+  #   targetKeyIdRef: app-data                   # reference kms.keys[].id
+
+
+⸻
+
+templates/_helpers.tpl
+
+{{- define "ns" -}}
+{{- default .Values.targetNamespace "ack-system" -}}
+{{- end -}}
+
+{{- define "name.orDefault" -}}
+{{- $id := index . "id" -}}
+{{- $k8s := index . "k8sName" | default (printf "%s-%s" (index . "prefix" | default "") $id) -}}
+{{- $k8s | trimAll "-" -}}
+{{- end -}}
+
+
+⸻
+
+templates/ns.yaml  (optional namespace creator)
+
+{{- if .Values.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "ns" . }}
+  labels:
+    app.kubernetes.io/managed-by: helm
+{{- end }}
+
+
+⸻
+
+templates/s3-buckets.yaml  (Bucket + optional Policy)
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $b := .Values.s3.buckets }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: Bucket
+metadata:
+  name: {{ default (printf "s3-%s" $b.id) $b.k8sName }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ required "s3.buckets[].name is required" $b.name }}
+  {{- if $b.region }}
+  createBucketConfiguration:
+    locationConstraint: {{ $b.region }}
+  {{- end }}
+  {{- if $b.tags }}
+  tags:
+  {{- range $k, $v := $b.tags }}
+    - key: {{ $k | quote }}
+      value: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+
+{{- if $b.policyJson }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketPolicy
+metadata:
+  name: {{ default (printf "s3-%s-policy" $b.id) $b.k8sName | printf "%s-policy" | replace "--" "-" }}
+  namespace: {{ $ns }}
+spec:
+  bucketRef:
+    from:
+      name: {{ default (printf "s3-%s" $b.id) $b.k8sName }}
+  policy: |
+{{ $b.policyJson | nindent 4 }}
+{{- end }}
+{{- end }}
+
+
+⸻
+
+templates/s3-bucket-features.yaml  (PAB, Encryption, Versioning, Lifecycle)
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $b := .Values.s3.buckets }}
+{{- $name := default (printf "s3-%s" $b.id) $b.k8sName }}
+{{- if $b.publicAccessBlock }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: PublicAccessBlock
+metadata:
+  name: {{ $name }}-pab
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $name }} } }
+  blockPublicAcls: true
+  blockPublicPolicy: true
+  ignorePublicAcls: true
+  restrictPublicBuckets: true
+{{- end }}
+
+{{- if $b.versioning }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketVersioning
+metadata:
+  name: {{ $name }}-ver
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $name }} } }
+  status: Enabled
+{{- end }}
+
+{{- if $b.encryption }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketEncryption
+metadata:
+  name: {{ $name }}-enc
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $name }} } }
+  rules:
+    - applyServerSideEncryptionByDefault:
+        sseAlgorithm: {{ default "aws:kms" $b.encryption.algorithm }}
+        {{- if $b.encryption.kmsKeyArn }}
+        kmsMasterKeyID: {{ $b.encryption.kmsKeyArn }}
+        {{- end }}
+      bucketKeyEnabled: true
+{{- end }}
+
+{{- if $b.lifecycleRules }}
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: BucketLifecycleConfiguration
+metadata:
+  name: {{ $name }}-lc
+  namespace: {{ $ns }}
+spec:
+  bucketRef: { from: { name: {{ $name }} } }
+  rules:
+{{ toYaml $b.lifecycleRules | nindent 4 }}
+{{- end }}
+{{- end }}
+
+
+⸻
+
+templates/iam-roles.yaml
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $r := .Values.iam.roles }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Role
+metadata:
+  name: {{ default $r.id $r.name }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ default $r.id $r.name }}
+  {{- if $r.tags }}
+  tags:
+  {{- range $k, $v := $r.tags }}
+    - key: {{ $k | quote }}
+      value: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+  assumeRolePolicyDocument: |
+{{- required "iam.roles[].assumeRolePolicyDocument is required" $r.assumeRolePolicyDocument | nindent 4 }}
+{{- if $r.inlinePolicies }}
+{{- range $_, $p := $r.inlinePolicies }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ printf "%s-%s" (default $r.id $r.name) $p.name | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ printf "%s-%s" (default $r.id $r.name) $p.name | trunc 128 | trimSuffix "-" }}
+  policyDocument: |
+{{ $p.document | nindent 4 }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: RolePolicyAttachment
+metadata:
+  name: {{ printf "%s-%s-attach" (default $r.id $r.name) $p.name | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+spec:
+  policyRef:
+    from:
+      name: {{ printf "%s-%s" (default $r.id $r.name) $p.name | trunc 63 | trimSuffix "-" }}
+  roleRef:
+    from:
+      name: {{ default $r.id $r.name }}
+{{- end }}
+{{- end }}
+
+{{- if $r.managedPolicyArns }}
+{{- range $_, $arn := $r.managedPolicyArns }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: RolePolicyAttachment
+metadata:
+  name: {{ printf "%s-%d-mpa" (default $r.id $r.name) $_ | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+spec:
+  policyARN: {{ $arn | quote }}
+  roleRef:
+    from:
+      name: {{ default $r.id $r.name }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+
+⸻
+
+templates/iam-policies.yaml  (standalone managed policies)
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $p := .Values.iam.policies }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ default $p.id $p.name }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ default $p.id $p.name }}
+  policyDocument: |
+{{ required "iam.policies[].policyDocument is required" $p.policyDocument | nindent 4 }}
+{{- end }}
+
+
+⸻
+
+templates/iam-attachments.yaml  (attach existing policy ARNs to roles)
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $a := .Values.iam.attachments }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: RolePolicyAttachment
+metadata:
+  name: {{ printf "%s-%d-extattach" $a.roleId $_ | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+spec:
+  policyARN: {{ required "iam.attachments[].policyArn is required" $a.policyArn | quote }}
+  roleRef:
+    from:
+      name: {{ required "iam.attachments[].roleId is required" $a.roleId }}
+{{- end }}
+
+
+⸻
+
+templates/kms-keys.yaml
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $k := .Values.kms.keys }}
+---
+apiVersion: kms.services.k8s.aws/v1alpha1
+kind: Key
+metadata:
+  name: {{ $k.id }}
+  namespace: {{ $ns }}
+spec:
+  description: {{ default "" $k.description | quote }}
+  keySpec: {{ default "SYMMETRIC_DEFAULT" $k.keySpec }}
+  keyUsage: {{ default "ENCRYPT_DECRYPT" $k.keyUsage }}
+  multiRegion: {{ ternary "true" "false" $k.multiRegion | default "false" }}
+  {{- if $k.tags }}
+  tags:
+  {{- range $k2, $v2 := $k.tags }}
+    - tagKey: {{ $k2 | quote }}
+      tagValue: {{ $v2 | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if $k.policy }}
+  policy: |
+{{ $k.policy | nindent 4 }}
+  {{- end }}
+{{- end }}
+
+
+⸻
+
+templates/kms-aliases.yaml
+
+{{- $ns := include "ns" . -}}
+{{- range $_, $a := .Values.kms.aliases }}
+---
+apiVersion: kms.services.k8s.aws/v1alpha1
+kind: Alias
+metadata:
+  name: {{ default $a.id ($a.name | replace "alias/" "" ) }}
+  namespace: {{ $ns }}
+spec:
+  name: {{ required "kms.aliases[].name is required (e.g., alias/app-data)" $a.name | quote }}
+  targetKeyRef:
+    from:
+      name: {{ required "kms.aliases[].targetKeyIdRef is required (must match kms.keys[].id)" $a.targetKeyIdRef }}
+{{- end }}
+
+
+⸻
+
+🚀 Using this with Flux
+
+HelmRepository (or GitRepository) + HelmRelease:
+
+# Example: GitRepository pointing to your infra repo
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: infra
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/your-org/infra.git
+  ref: { branch: main }
+
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: ack-infra
+  namespace: flux-system
+spec:
+  interval: 10m
+  targetNamespace: ack-system              # where ACK controllers watch
+  chart:
+    spec:
+      sourceRef: { kind: GitRepository, name: infra }
+      chart: charts/ack-infra
+  valuesFrom:
+    - kind: ConfigMap
+      name: ack-infra-values               # put your per-env values here
+      valuesKey: values.yaml
+
+ConfigMap with values (per env / per namespace / per cluster—your choice):
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ack-infra-values
+  namespace: flux-system
+data:
+  values.yaml: |
+    targetNamespace: ack-system
+    createNamespace: true
+
+    s3:
+      buckets:
+        - id: logs
+          k8sName: s3-logs
+          name: myorg-nc-dev-logs-123456789012
+          region: us-east-1
+          publicAccessBlock: true
+          versioning: true
+          encryption:
+            algorithm: aws:kms
+            kmsKeyArn: arn:aws:kms:us-east-1:123456789012:key/NC-DEV-KEY
+
+    iam:
+      roles:
+        - id: app-irsa
+          assumeRolePolicyDocument: |
+            { "Version":"2012-10-17","Statement":[ ... ] }
+          managedPolicyArns:
+            - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      policies:
+        - id: custom-s3-read
+          policyDocument: |
+            { "Version":"2012-10-17","Statement":[ ... ] }
+      attachments:
+        - roleId: app-irsa
+          policyArn: arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+    kms:
+      keys:
+        - id: app-data
+          description: "App data KMS CMK"
+      aliases:
+        - name: alias/app-data
+          targetKeyIdRef: app-data
+
+💡 Tip: keep policy documents as JSON strings in values (ACK expects JSON). Use SOPS if any content is sensitive.
+
+⸻
+
+✅ Notes & gotchas
+	•	Make sure the ACK controllers for s3/iam/kms (and their CRDs) are installed first.
+	•	targetNamespace must be a namespace watched by those controllers.
+	•	Bucket names must be globally unique; keep that in values.
+	•	For IAM policy/assume-role docs, provide valid JSON (not YAML objects).
+	•	If you need more S3 features later (Replication, CORS), add another templates/s3-*.yaml with a range over the same item.
+
+⸻
+
+If you want, tell me one concrete environment’s requirements (a couple of buckets, one role with policies, one KMS key+alias) and I’ll produce the exact values.yaml you can drop into your repo.
