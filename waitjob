@@ -1,0 +1,165 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ack-ready-checker
+  namespace: {{ .Values.namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ack-ready-checker
+  namespace: {{ .Values.namespace }}
+rules:
+  - apiGroups: ["kms.services.k8s.aws"]
+    resources: ["keys"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["s3.services.k8s.aws"]
+    resources: ["buckets"]
+    verbs: ["get","list","watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ack-ready-checker
+  namespace: {{ .Values.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ack-ready-checker
+subjects:
+  - kind: ServiceAccount
+    name: ack-ready-checker
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ack-kms-and-buckets-ready
+  namespace: {{ .Values.namespace }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "50"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: ack-ready-checker
+      restartPolicy: Never
+      containers:
+        - name: wait
+          image: bitnami/kubectl:latest
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              ns="{{ .Values.namespace }}"
+              timeout="{{ .Values.timeoutSeconds | default 1800 }}"
+              interval="{{ .Values.checkIntervalSeconds | default 5 }}"
+
+              # Expand Helm lists into simple space-separated strings
+              kms_keys="{{ join " " .Values.kmsKeys }}"
+              buckets="{{ join " " .Values.buckets }}"
+
+              if [ -z "$kms_keys" ] && [ -z "$buckets" ]; then
+                echo "Nothing to wait for (no kmsKeys or buckets provided)."
+                exit 0
+              fi
+
+              # ---- Helpers ---------------------------------------------------
+              now() { date +%s; }
+
+              # Read a single condition's Status from an ACK resource
+              # $1=kind(plural GVR short), $2=name, $3=condition type
+              cond_status () {
+                local gvr="$1" name="$2" typ="$3"
+                kubectl -n "$ns" get "$gvr" "$name" -o jsonpath="{range .status.conditions[?(@.type==\"$typ\")] }{.status}{end}" 2>/dev/null || true
+              }
+
+              # Pretty print all conditions for diagnostics
+              print_conditions () {
+                local gvr="$1" name="$2"
+                kubectl -n "$ns" get "$gvr" "$name" -o jsonpath='{"- "}{.metadata.name}{": "}{range .status.conditions[*]}{.type}{"="}{.status}{" "}{end}{"\n"}' 2>/dev/null || true
+              }
+
+              # KMS Key is "ready" when:
+              #   ACK.ResourceSynced=True AND NOT ACK.Terminal=True AND NOT ACK.Recoverable=True
+              key_ready () {
+                local name="$1"
+                local rs rec term
+                rs="$(cond_status key.kms.services.k8s.aws "$name" ACK.ResourceSynced)"
+                rec="$(cond_status key.kms.services.k8s.aws "$name" ACK.Recoverable)"
+                term="$(cond_status key.kms.services.k8s.aws "$name" ACK.Terminal)"
+                [ "$rs" = "True" ] && [ "$rec" != "True" ] && [ "$term" != "True" ]
+              }
+
+              # Bucket is "ready" when:
+              #   ACK.ResourceSynced=True
+              #   AND (ACK.ReferencesResolved=True OR ReferencesResolved not present)
+              #   AND NOT ACK.Terminal=True
+              #   AND NOT ACK.Recoverable=True
+              bucket_ready () {
+                local name="$1"
+                local rs rec term ref
+                rs="$(cond_status bucket.s3.services.k8s.aws "$name" ACK.ResourceSynced)"
+                rec="$(cond_status bucket.s3.services.k8s.aws "$name" ACK.Recoverable)"
+                term="$(cond_status bucket.s3.services.k8s.aws "$name" ACK.Terminal)"
+                ref="$(cond_status bucket.s3.services.k8s.aws "$name" ACK.ReferencesResolved)"
+                [ "$rs" = "True" ] && [ "$rec" != "True" ] && [ "$term" != "True" ] && { [ -z "$ref" ] || [ "$ref" = "True" ]; }
+              }
+
+              # Wait for a list of objects to exist
+              wait_exist () {
+                local gvr="$1"; shift
+                local names="$*"
+                local start="$(now)"
+                echo "Waiting for $(echo "$names" | wc -w | tr -d ' ') $gvr object(s) to exist…"
+                while true; do
+                  local all=1
+                  for n in $names; do
+                    if ! kubectl -n "$ns" get "$gvr" "$n" >/dev/null 2>&1; then
+                      all=0; break
+                    fi
+                  done
+                  [ $all -eq 1 ] && break
+                  [ $(( $(now) - start )) -ge "$timeout" ] && { echo "Timed out waiting for $gvr existence"; exit 1; }
+                  sleep "$interval"
+                done
+              }
+
+              # Wait until a predicate returns true for all names
+              wait_ready_all () {
+                local kind="$1" pred="$2"; shift 2
+                local names="$*"
+                local start="$(now)"
+                echo "Waiting for $kind readiness…"
+                while true; do
+                  local remaining=""
+                  for n in $names; do
+                    if $pred "$n"; then
+                      echo "✓ $kind $n ready"
+                    else
+                      print_conditions "$([ "$kind" = "KMS Key" ] && echo key.kms.services.k8s.aws || echo bucket.s3.services.k8s.aws)" "$n"
+                      remaining="$remaining $n"
+                    fi
+                  done
+                  [ -z "$remaining" ] && break
+                  [ $(( $(now) - start )) -ge "$timeout" ] && { echo "Timed out; not ready:$remaining"; exit 1; }
+                  sleep "$interval"
+                done
+              }
+
+              # ---- Phase 1: KMS Keys ----------------------------------------
+              if [ -n "$kms_keys" ]; then
+                wait_exist key.kms.services.k8s.aws $kms_keys
+                wait_ready_all "KMS Key" key_ready $kms_keys
+              fi
+
+              # ---- Phase 2: Buckets -----------------------------------------
+              if [ -n "$buckets" ]; then
+                wait_exist bucket.s3.services.k8s.aws $buckets
+                wait_ready_all "Bucket" bucket_ready $buckets
+              fi
+
+              echo "All requested KMS Keys and Buckets are ready."
+              exit 0
