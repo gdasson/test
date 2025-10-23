@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bucket-policy-patcher
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: "*/1 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: bucket-policy-patcher
+          restartPolicy: OnFailure
+          containers:
+            - name: patch
+              image: bitnami/kubectl:latest
+              command: ["/bin/sh","-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  ns="{{ .Values.namespace }}"
+
+                  patch_one () {
+                    b="$1"; key="$2"
+
+                    # Try FieldExport'd ConfigMap first
+                    arn="$(kubectl -n "$ns" get cm ${key}-arn -o jsonpath='{.data.arn}' 2>/dev/null || true)"
+                    if [ -z "$arn" ]; then
+                      arn="$(kubectl -n "$ns" get key.kms.services.k8s.aws "$key" -o jsonpath='{.status.ackResourceMetadata.arn}' 2>/dev/null || true)"
+                    fi
+                    [ -z "$arn" ] && { echo "ARN not ready for $key; skipping"; return 0; }
+
+                    # Read current policy on the Bucket (if any)
+                    current="$(kubectl -n "$ns" get bucket.s3.services.k8s.aws "$b" -o jsonpath='{.spec.policy}' 2>/dev/null || true)"
+
+                    # Desired policy enforcing SSE-KMS and the exact key ARN
+                    cat > /tmp/policy.json <<EOF
+                    {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                        {
+                          "Sid": "DenyPutWithoutKMSEncryption",
+                          "Effect": "Deny",
+                          "Principal": "*",
+                          "Action": "s3:PutObject",
+                          "Resource": "arn:aws:s3:::$b/*",
+                          "Condition": {
+                            "StringNotEquals": { "s3:x-amz-server-side-encryption": "aws:kms" }
+                          }
+                        },
+                        {
+                          "Sid": "DenyPutWithWrongKMSKey",
+                          "Effect": "Deny",
+                          "Principal": "*",
+                          "Action": "s3:PutObject",
+                          "Resource": "arn:aws:s3:::$b/*",
+                          "Condition": {
+                            "StringNotEquals": {
+                              "s3:x-amz-server-side-encryption-aws-kms-key-id": "$arn"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                    EOF
+
+                    desired="$(tr -d '\n' < /tmp/policy.json | sed 's/  *//g')"
+
+                    if [ "$current" = "$desired" ]; then
+                      echo "Policy already up-to-date for $b"
+                      return 0
+                    fi
+
+                    # Patch Bucket.spec.policy (merge)
+                    kubectl -n "$ns" patch bucket.s3.services.k8s.aws "$b" --type merge -p "{\"spec\":{\"policy\":\"$desired\"}}"
+                    echo "Patched policy for $b with ARN $arn"
+                  }
+
+                  # Iterate all declared pairs
+                  {{- range .Values.pairs }}
+                  patch_one "{{ .bucketName }}" "{{ .kmsKeyName }}"
+                  {{- end }}
