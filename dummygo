@@ -1,0 +1,490 @@
+Awesome—here’s a tiny, production-ish Go demo you can drop in and run. It writes a dummy file to S3 every few seconds and also writes a row to Postgres each time.
+
+Directory layout
+
+demo-app/
+  cmd/app/main.go
+  internal/config/config.go
+  internal/db/pg.go
+  internal/s3uploader/uploader.go
+  sql/001_init.sql
+  .env.example
+  Dockerfile
+  Makefile
+  README.md
+  go.mod
+
+
+⸻
+
+go.mod
+
+module github.com/your-org/demo-app
+
+go 1.22
+
+require (
+	github.com/aws/aws-sdk-go-v2 v1.30.5
+	github.com/aws/aws-sdk-go-v2/config v1.27.27
+	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.16.22
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.59.3
+	github.com/google/uuid v1.6.0
+	github.com/jackc/pgx/v5 v5.6.0
+)
+
+
+⸻
+
+internal/config/config.go
+
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+type Config struct {
+	// S3
+	AWSRegion        string
+	S3Bucket         string
+	S3Endpoint       string // optional (e.g., MinIO/Localstack)
+	S3ForcePathStyle bool   // true for MinIO
+
+	// DB (either PG_DSN or individual vars)
+	PGDSN  string
+	PGHost string
+	PGPort int
+	PGUser string
+	PGPass string
+	PGDB   string
+	SSLMode string // disable, require, verify-full, etc.
+
+	// App
+	Interval time.Duration
+	FileSize int // bytes
+}
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func getint(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
+func getbool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+func getdur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func Load() (*Config, error) {
+	cfg := &Config{
+		AWSRegion:        getenv("AWS_REGION", "us-east-1"),
+		S3Bucket:         os.Getenv("S3_BUCKET"),
+		S3Endpoint:       os.Getenv("S3_ENDPOINT"),
+		S3ForcePathStyle: getbool("S3_FORCE_PATH_STYLE", false),
+
+		PGDSN:  os.Getenv("PG_DSN"),
+		PGHost: getenv("PG_HOST", "localhost"),
+		PGPort: getint("PG_PORT", 5432),
+		PGUser: getenv("PG_USER", "postgres"),
+		PGPass: getenv("PG_PASSWORD", "postgres"),
+		PGDB:   getenv("PG_DATABASE", "postgres"),
+		SSLMode: getenv("PG_SSLMODE", "disable"),
+
+		Interval: getdur("INTERVAL", 5*time.Second),
+		FileSize: getint("FILE_SIZE_BYTES", 512),
+	}
+
+	if cfg.S3Bucket == "" {
+		return nil, fmt.Errorf("S3_BUCKET is required")
+	}
+
+	return cfg, nil
+}
+
+func (c *Config) DSN() string {
+	if c.PGDSN != "" {
+		return c.PGDSN
+	}
+	// pgx DSN format
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+		c.PGUser, c.PGPass, c.PGHost, c.PGPort, c.PGDB, c.SSLMode)
+}
+
+
+⸻
+
+internal/db/pg.go
+
+package db
+
+import (
+	"context"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+type DB struct {
+	conn *pgx.Conn
+}
+
+func Connect(ctx context.Context, dsn string) (*DB, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &DB{conn: conn}, nil
+}
+
+func (d *DB) Close(ctx context.Context) error {
+	return d.conn.Close(ctx)
+}
+
+func (d *DB) EnsureSchema(ctx context.Context) error {
+	_, err := d.conn.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS events (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  s3_key TEXT NOT NULL,
+  note   TEXT
+);`)
+	return err
+}
+
+func (d *DB) InsertEvent(ctx context.Context, s3Key, note string) error {
+	_, err := d.conn.Exec(ctx,
+		`INSERT INTO events (s3_key, note, created_at) VALUES ($1, $2, $3)`,
+		s3Key, note, time.Now().UTC(),
+	)
+	return err
+}
+
+
+⸻
+
+internal/s3uploader/uploader.go
+
+package s3uploader
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/google/uuid"
+)
+
+type Client struct {
+	s3     *s3.Client
+	upload *manager.Uploader
+	bucket string
+}
+
+type Options struct {
+	Region          string
+	Bucket          string
+	Endpoint        string // optional for MinIO/Localstack
+	ForcePathStyle  bool
+}
+
+func New(ctx context.Context, opt Options) (*Client, error) {
+	lo := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(opt.Region),
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, lo...)
+	if err != nil {
+		return nil, err
+	}
+
+	s3Opts := s3.Options{
+		Region:      opt.Region,
+		Credentials: cfg.Credentials,
+		Retryer:     s3.NewStandardRetryer(),
+	}
+	if opt.Endpoint != "" {
+		s3Opts.BaseEndpoint = aws.String(opt.Endpoint)
+	}
+	if opt.ForcePathStyle {
+		s3Opts.UsePathStyle = true
+	}
+	cli := s3.New(s3Opts)
+	up := manager.NewUploader(cli)
+
+	return &Client{s3: cli, upload: up, bucket: opt.Bucket}, nil
+}
+
+func (c *Client) PutRandom(ctx context.Context, prefix string, size int) (string, error) {
+	key := fmt.Sprintf("%s/%s.txt", prefix, uuid.New().String())
+
+	buf := make([]byte, size)
+	_, _ = rand.Read(buf)
+	content := bytes.NewBuffer(nil)
+	content.WriteString(fmt.Sprintf("time=%s\n", time.Now().UTC().Format(time.RFC3339Nano)))
+	content.WriteString("random-bytes=")
+	content.Write(buf)
+
+	_, err := c.upload.Upload(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(c.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(content.Bytes()),
+		ContentType: aws.String("text/plain"),
+		ACL:         aws.String("private"),
+	})
+	if err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// Optional: quick head to sanity check object existence
+func (c *Client) Head(ctx context.Context, key string) (int, error) {
+	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if out.ContentLength == nil {
+		return 0, nil
+	}
+	return int(*out.ContentLength), nil
+}
+
+var _ = http.MethodGet // silence unused import warning in some editors
+
+
+⸻
+
+cmd/app/main.go
+
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/your-org/demo-app/internal/config"
+	"github.com/your-org/demo-app/internal/db"
+	"github.com/your-org/demo-app/internal/s3uploader"
+)
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config error: %v", err)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	// DB
+	pg, err := db.Connect(ctx, cfg.DSN())
+	if err != nil {
+		log.Fatalf("db connect error: %v", err)
+	}
+	defer pg.Close(context.Background())
+
+	if err := pg.EnsureSchema(ctx); err != nil {
+		log.Fatalf("ensure schema: %v", err)
+	}
+
+	// S3
+	upl, err := s3uploader.New(ctx, s3uploader.Options{
+		Region:         cfg.AWSRegion,
+		Bucket:         cfg.S3Bucket,
+		Endpoint:       cfg.S3Endpoint,
+		ForcePathStyle: cfg.S3ForcePathStyle,
+	})
+	if err != nil {
+		log.Fatalf("s3 init error: %v", err)
+	}
+
+	log.Printf("starting writer: bucket=%s interval=%s fileSize=%dB", cfg.S3Bucket, cfg.Interval, cfg.FileSize)
+
+	t := time.NewTicker(cfg.Interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("shutting down")
+			return
+		case <-t.C:
+			key, err := upl.PutRandom(ctx, "demo", cfg.FileSize)
+			if err != nil {
+				log.Printf("s3 put error: %v", err)
+				continue
+			}
+			if err := pg.InsertEvent(ctx, key, "demo write"); err != nil {
+				log.Printf("db insert error: %v", err)
+				continue
+			}
+			log.Printf("wrote %s and recorded event", key)
+		}
+	}
+}
+
+
+⸻
+
+sql/001_init.sql
+
+CREATE TABLE IF NOT EXISTS events (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  s3_key TEXT NOT NULL,
+  note   TEXT
+);
+
+
+⸻
+
+.env.example
+
+# --- S3 ---
+AWS_REGION=us-east-1
+S3_BUCKET=your-bucket-name
+# For MinIO/Localstack (optional):
+# S3_ENDPOINT=http://minio:9000
+# S3_FORCE_PATH_STYLE=true
+# AWS_ACCESS_KEY_ID=minioadmin
+# AWS_SECRET_ACCESS_KEY=minioadmin
+
+# --- Postgres (choose PG_DSN or individual vars) ---
+# PG_DSN=postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+PG_HOST=localhost
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=postgres
+PG_DATABASE=postgres
+PG_SSLMODE=disable
+
+# --- App ---
+INTERVAL=5s
+FILE_SIZE_BYTES=512
+
+
+⸻
+
+Dockerfile (multi-stage, small final image)
+
+# Build
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+ENV CGO_ENABLED=0
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN go build -o /bin/app ./cmd/app
+
+# Run (distroless)
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=build /bin/app /app
+USER nonroot:nonroot
+ENTRYPOINT ["/app"]
+
+
+⸻
+
+Makefile
+
+APP=demo-app
+IMAGE?=ghcr.io/your-org/demo-app:latest
+
+.PHONY: all build run tidy docker-build docker-run
+
+all: build
+
+tidy:
+	go mod tidy
+
+build: tidy
+	go build -o bin/$(APP) ./cmd/app
+
+run:
+	. ./.env && ./bin/$(APP)
+
+docker-build:
+	docker build -t $(IMAGE) .
+
+docker-run:
+	docker run --rm -it --name $(APP) \
+		--env-file .env \
+		$(IMAGE)
+
+
+⸻
+
+README.md (quick start)
+
+## Demo App (Go) — S3 + Postgres writer
+
+### Prereqs
+- Go 1.22+
+- Postgres reachable (set PG_* or PG_DSN)
+- S3 bucket reachable (AWS creds, or MinIO via S3_ENDPOINT + S3_FORCE_PATH_STYLE)
+
+### Local
+```bash
+cp .env.example .env
+go build -o bin/demo-app ./cmd/app
+./bin/demo-app
+
+Docker
+
+make docker-build
+# Edit .env with your creds/bucket/PG
+make docker-run
+
+What it does
+
+Every INTERVAL it uploads a small text file to s3://$S3_BUCKET/demo/<uuid>.txt and inserts a row into events in Postgres.
+
+---
+
+## Notes
+- Works with **real AWS S3** or **MinIO/Localstack** (set `S3_ENDPOINT` and `S3_FORCE_PATH_STYLE=true`).
+- The app uses the AWS default credential chain (env vars, shared config, IRSA, etc.).
+- Graceful shutdown on SIGINT.
+- If you want a `docker-compose.yml` for Postgres/MinIO, say the word and I’ll add it.
