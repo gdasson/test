@@ -1,0 +1,132 @@
+got it — here’s a crisp design you can drop into a doc. no YAML, just how the framework works.
+
+OPA Gatekeeper Exception Framework — Design (Air-gapped, GitOps)
+
+Objectives
+	•	Enforce org-wide Kubernetes policies via Gatekeeper while allowing time-boxed exceptions.
+	•	Encode every exception with an Archer exception ID and an expiry/end date; auto-relock on expiry.
+	•	Keep policies and exceptions in separate Git repos; all changes flow through GitOps (Flux/Argo).
+
+High-Level Architecture
+	•	Gatekeeper enforces constraints (ConstraintTemplates + Constraints).
+	•	Exception CRD (cluster-scoped) stores approved exceptions (policy name, Archer ID, reason, expiry, scope).
+	•	Gatekeeper Config syncs the Exception CRD objects into OPA’s cache so Rego can read them at admission.
+	•	Rego library embedded in each policy checks: “is there a valid, unexpired, in-scope exception for this request?”
+	•	Optional lightweight controller (nice-to-have): materializes status, sends alerts, and prunes expired records (policy still re-locks without it).
+
+Repositories & Ownership
+	•	Repo A – gatekeeper-constraints (owned by Platform/Security)
+	•	Gatekeeper install/config
+	•	ConstraintTemplates (policy logic)
+	•	Constraints (cluster-wide bindings/defaults)
+	•	Repo B – gatekeeper-exceptions (owned by App teams with Risk/Platform approval)
+	•	Exception CRD definition (once)
+	•	Exception records (one file per exception)
+	•	Branch/PR policy
+	•	Constraints: protected, security review required.
+	•	Exceptions: require linked Archer ID; risk & platform approval via CODEOWNERS.
+
+Exception Data Model (CRD fields)
+	•	policyName — string; must equal the target ConstraintTemplate name.
+	•	archerId — string; required (ticket/exception reference).
+	•	reason — string; human-readable justification.
+	•	expiresOn — RFC3339 UTC timestamp; after this moment, exception is invalid.
+	•	scope — where the exception applies:
+	•	namespaceSelector — label selector (matchLabels/expressions).
+	•	objectSelector — label selector for target workloads/resources.
+	•	operations — optional list (CREATE, UPDATE) to narrow applicability.
+
+Admission-Time Decision (per request)
+	1.	Evaluate policy logic (e.g., deny privileged containers, enforce image allowlist).
+	2.	Fetch candidate exceptions from OPA cache (synced CR instances).
+	3.	Filter for:
+	•	matching policyName,
+	•	expiresOn in the future,
+	•	request operation in operations (if specified),
+	•	namespace & object label selectors match.
+	4.	If at least one valid exception applies → allow (and annotate decision with Archer ID); else → deny.
+
+Lifecycle & Governance
+	•	Request: Team opens PR in exceptions repo with a new exception record (must include Archer ID, expiry).
+	•	Validate: CI checks schema + business rules (e.g., max duration ≤ 90 days; Archer ID pattern).
+	•	Approve: Risk + Platform approve PR; GitOps sync applies CR to cluster(s).
+	•	Use: Deployments in scope are admitted until expiry.
+	•	Expire: At expiresOn, policy auto-relocks (no code paths rely on cleanup).
+	•	Renew: New PR with new/extended expiry (fresh risk review).
+
+GitOps Integration
+	•	Both repos synced via Flux/Argo:
+	•	Constraints: lower cadence; pinned versions.
+	•	Exceptions: frequent cadence; narrow scopes.
+	•	Multi-cluster:
+	•	Either replicate both repos to all clusters,
+	•	Or partition by path/branch per environment/region.
+
+Air-Gapped Considerations
+	•	Gatekeeper and all policies are YAML-only; no external calls.
+	•	If using the optional controller, build and mirror once to internal registry.
+	•	No runtime dependency on external Archer systems (ID is a string field; validation happens in CI).
+
+Observability & Audit
+	•	Admission annotations: on allowed-by-exception decisions, include Archer ID and expiry in audit annotations (visible in API server audit logs and Gatekeeper audit).
+	•	Metrics:
+	•	Count of active exceptions by policy/team/expiry bucket.
+	•	Deny/allow rate per policy; exceptions-used rate.
+	•	Alerts:
+	•	N days before expiry (e.g., 14/7/3/1) to resource owners + risk channel.
+	•	Exceptions missing Archer ID or over max duration → PR fails in CI.
+
+Security & Controls
+	•	Fail-closed posture: if exception objects are missing or malformed, policies still deny.
+	•	Scope minimization: selectors must target specific namespaces/apps; wildcards disallowed by CI.
+	•	Duration limits: CI enforces max window (e.g., ≤ 90 days).
+	•	Immutability hints: discourage updating archerId post-merge; treat renewals as new records.
+	•	Separation of duties: App teams propose; Risk/Platform approve; Gatekeeper enforces.
+
+Performance & Scale
+	•	Exception objects are small and cluster-scoped; OPA reads from in-memory cache (fast).
+	•	Label-selector matching in Rego is O(n) in number of exception records; keep records lean via scoping and TTL.
+	•	Gatekeeper audit (periodic) surfaces drift or resources that would be denied without exceptions.
+
+Optional Controller (Enhancements, not required)
+	•	Watches Exception CRs and:
+	•	Sets status.phase = Valid/Expired/Invalid with reasons,
+	•	Emits Kubernetes Events & webhooks (Slack/Email) for upcoming expiry,
+	•	Garbage-collects expired records (pure hygiene),
+	•	Cross-checks policyName exists; flags orphaned exceptions.
+	•	Can be replaced with CI + Prometheus rules if you prefer fewer moving parts.
+
+Example Policies (to start)
+	•	Privileged container deny
+	•	HostPath/HostNetwork/HostPID/HostIPC restrictions
+	•	Image registry allowlist
+	•	Required seccomp profile / runAsNonRoot
+	•	Dangerous capabilities drop list
+	•	Ingress/Service type restrictions (e.g., LoadBalancer gating)
+
+CI Validations (Exceptions repo)
+	•	JSON schema validation.
+	•	policyName exists in current constraints.
+	•	expiresOn is RFC3339 and within max duration.
+	•	archerId matches org regex (configurable).
+	•	scope selectors are non-empty and non-wildcard (or on allowlist).
+	•	Ownership labels (team, service) required for routing alerts.
+
+Rollout & Migration Plan
+	1.	Ship Gatekeeper with constraints in Warn (dry-run) for 1–2 sprints; capture would-deny telemetry.
+	2.	Enable Deny for low-risk policies; keep “spiky” ones in Warn until exceptions are in place.
+	3.	Socialize exception PR template & CI checks; publish dashboards and contacts.
+	4.	Add alerts and SLOs; review top offending namespaces/apps monthly.
+
+Non-Goals
+	•	No dynamic calls to Archer; approval stays in Git.
+	•	No per-namespace policy authoring by app teams (central ownership).
+	•	No reliance on mutating webhooks.
+
+Acceptance Criteria
+	•	Exceptions with valid Archer ID + future expiry can temporarily bypass a policy only within declared scope.
+	•	On/after expiry, re-deploys are denied automatically without human intervention.
+	•	All decisions are observable via audit logs/metrics and attributable to an Archer ID.
+	•	Entire system runs in air-gapped clusters and is managed via GitOps.
+
+If you want, I can turn this into a 1-page PDF/slide with a diagram (components + flow) and a PR checklist you can share with Risk and app teams.
