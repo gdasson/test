@@ -1,0 +1,222 @@
+Totally fair point — if Terraform doesn’t know (or shouldn’t care about) every addon namespace, we shouldn’t push ConfigMap creation into Terraform at all.
+
+We can keep the “write values once per cluster, share across addons” idea, but implement it fully in Git/Fleet using Kustomize, so:
+	•	Terraform only needs to create the GitRepo (or even nothing, if you make it via UI).
+	•	You define one shared values file per cluster.
+	•	Kustomize turns that into per-namespace ConfigMaps for each addon.
+	•	Each addon Helm bundle uses valuesFrom to read its ConfigMap (same content, different namespace).
+
+No duplication of values in Git, no Terraform needing to know namespaces.
+
+⸻
+
+1. Final repo layout (cluster-baseline)
+
+cluster-baseline/
+  addons/
+    gatekeeper/
+      fleet.yaml           # shared Gatekeeper addon
+    sysdig/
+      fleet.yaml           # shared Sysdig addon
+
+  clusters/
+    prod-us-east1/
+      fleet.yaml
+      kustomization.yaml
+      addons-values.yaml   # 🔥 single shared values file for this cluster
+
+    dev-us-east1/
+      fleet.yaml
+      kustomization.yaml
+      addons-values.yaml   # same schema, different content
+
+	•	addons/ = shared code, no per-cluster duplication.
+	•	clusters/<cluster>/addons-values.yaml = one “cluster settings” file.
+	•	clusters/<cluster>/kustomization.yaml generates per-namespace ConfigMaps from that single file.
+
+⸻
+
+2. Shared addons (unchanged, still DRY)
+
+2.1 Gatekeeper addon – addons/gatekeeper/fleet.yaml
+
+# cluster-baseline/addons/gatekeeper/fleet.yaml
+name: gatekeeper-addon
+defaultNamespace: gatekeeper-system
+
+helm:
+  releaseName: gatekeeper
+  chart: gatekeeper
+  repo: https://artifactory.mycompany.com/helm/gatekeeper
+  version: 3.15.0
+
+  valuesFrom:
+    - configMapKeyRef:
+        name: gatekeeper-values
+        key: values.yaml
+        optional: true
+
+2.2 Sysdig addon – addons/sysdig/fleet.yaml
+
+# cluster-baseline/addons/sysdig/fleet.yaml
+name: sysdig-addon
+defaultNamespace: sysdig-agent
+
+helm:
+  releaseName: sysdig-agent
+  chart: sysdig
+  repo: https://artifactory.mycompany.com/helm/sysdig
+  version: 1.5.0
+
+  valuesFrom:
+    - configMapKeyRef:
+        name: sysdig-values
+        key: values.yaml
+        optional: true
+
+Each bundle just expects a ConfigMap in its own namespace, nothing more.
+
+⸻
+
+3. Per-cluster: one shared values file + kustomize fan-out
+
+3.1 Cluster-level fleet.yaml
+
+This just tells Fleet “treat this folder as a Kustomize bundle”.
+
+clusters/prod-us-east1/fleet.yaml
+
+# cluster-baseline/clusters/prod-us-east1/fleet.yaml
+name: prod-us-east1-values
+defaultNamespace: kube-system   # irrelevant; Kustomize resources bring their own namespaces
+
+kustomize:
+  dir: .
+
+3.2 Kustomization that generates all addon ConfigMaps
+
+clusters/prod-us-east1/kustomization.yaml
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+  - name: gatekeeper-values
+    namespace: gatekeeper-system
+    files:
+      - values.yaml=addons-values.yaml   # 🔥 same file for all addons
+
+  - name: sysdig-values
+    namespace: sysdig-agent
+    files:
+      - values.yaml=addons-values.yaml   # 🔥 same file reused
+
+generatorOptions:
+  disableNameSuffixHash: true            # so names stay exactly gatekeeper-values/sysdig-values
+
+	•	Kustomize reads addons-values.yaml once.
+	•	Generates two ConfigMaps:
+	•	gatekeeper-values in gatekeeper-system
+	•	sysdig-values in sysdig-agent
+	•	Both have the same data["values.yaml"] content.
+
+Helm charts will just ignore keys they don’t use, so you can put all shared stuff in one structure.
+
+3.3 The one shared values file per cluster
+
+clusters/prod-us-east1/addons-values.yaml
+
+# this is the *only* place you define cluster-specific addon values in Git
+gatekeeper:
+  replicaCount: 3
+  audit:
+    enable: true
+    intervalSeconds: 20
+  validatingWebhook:
+    failurePolicy: Ignore
+
+sysdig:
+  agent:
+    apiKey: prod-API-KEY
+    collectorEndpoint: logs.prod.example.com
+    resources:
+      limits:
+        cpu: 300m
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+Then, in your Helm charts you expect values like:
+	•	for Gatekeeper: .Values.gatekeeper.*
+	•	for Sysdig: .Values.sysdig.*
+
+Each chart will see the full YAML blob but only use its own subtree; the rest is harmless.
+
+For dev-us-east1, you just copy the same three files, change addons-values.yaml contents:
+
+# clusters/dev-us-east1/addons-values.yaml
+gatekeeper:
+  replicaCount: 1
+  audit:
+    enable: true
+    intervalSeconds: 60
+
+sysdig:
+  agent:
+    apiKey: dev-API-KEY
+    collectorEndpoint: logs.dev.example.com
+
+No need to know namespaces in Terraform; Git (and Kustomize) handle them.
+
+⸻
+
+4. GitRepo per cluster (still same pattern)
+
+Terraform (or Rancher UI) just creates a GitRepo with two paths:
+
+PROD cluster GitRepo
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: prod-us-east1-core
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/cluster-baseline.git
+  branch: main
+  paths:
+    - addons                  # shared addon bundles
+    - clusters/prod-us-east1  # this cluster's kustomized values
+
+DEV cluster GitRepo
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: dev-us-east1-core
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/cluster-baseline.git
+  branch: main
+  paths:
+    - addons
+    - clusters/dev-us-east1
+
+Terraform never needs to know gatekeeper-system or sysdig-agent.
+Those are encoded once in kustomization.yaml.
+
+⸻
+
+5. Why this answers your concern
+
+“Terraform doesn’t know all the namespaces in advance”
+
+	•	✅ That’s fine now; Terraform doesn’t create any ConfigMaps or namespaces.
+	•	✅ All namespace knowledge is in Git (Kustomize), which is exactly where you do want cluster layout encoded.
+	•	✅ You still have:
+	•	no code duplication (addons live once)
+	•	one values file per cluster (addons-values.yaml)
+	•	multiple addons using that same values file, safely, via Kustomize → ConfigMaps → valuesFrom.
+
+If you want, next I can add a third addon (e.g. metrics-server) into this repo using the exact same pattern so you can see how future add-ons plug in cleanly.
