@@ -1,0 +1,248 @@
+Nice 😄 let’s lock this in.
+
+Below is a complete, ready-to-test repo for your leaf Fleet model:
+	•	One core repo: cluster-baseline
+	•	Shared addon code in addons/ (no duplication)
+	•	Per-cluster overrides as ConfigMaps in clusters/<cluster>/values/
+	•	Core repo also declares the Gatekeeper policies GitRepo (so it “owns” that repo too)
+
+You can literally copy this structure into a Git repo and go.
+
+⸻
+
+1. Repo layout: cluster-baseline
+
+cluster-baseline/
+  addons/
+    gatekeeper/
+      fleet.yaml               # shared Gatekeeper addon bundle
+      policies-gitrepo.yaml    # shared GitRepo for policies repo
+    sysdig/
+      fleet.yaml               # shared Sysdig addon bundle
+
+  clusters/
+    prod-us-east1/
+      values/
+        gatekeeper-values.yaml
+        sysdig-values.yaml
+
+    dev-us-east1/
+      values/
+        gatekeeper-values.yaml
+        sysdig-values.yaml
+
+	•	No fleet.yaml per cluster
+	•	No duplicated addon folder trees
+	•	Only thing that changes per cluster = files under clusters/<cluster>/values/.
+
+⸻
+
+2. Addons (shared for all clusters)
+
+2.1 Gatekeeper addon – addons/gatekeeper/fleet.yaml
+
+# cluster-baseline/addons/gatekeeper/fleet.yaml
+name: gatekeeper-addon
+defaultNamespace: gatekeeper-system
+
+helm:
+  releaseName: gatekeeper
+  chart: gatekeeper
+  repo: https://artifactory.mycompany.com/helm/gatekeeper
+  version: 3.15.0        # <-- set to your real version
+
+  # Cluster-specific overrides are pulled from a ConfigMap
+  valuesFrom:
+    - configMapKeyRef:
+        name: gatekeeper-values
+        key: values.yaml
+        optional: true
+
+This single file is used by every cluster.
+
+⸻
+
+2.2 Gatekeeper policies repo – addons/gatekeeper/policies-gitrepo.yaml
+
+# cluster-baseline/addons/gatekeeper/policies-gitrepo.yaml
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: gatekeeper-policies
+  namespace: fleet-local                # leaf Fleet namespace
+spec:
+  repo: https://git.example.com/gatekeeper-policies.git
+  branch: main
+  # structure in that repo is up to you; example:
+  paths:
+    - .                                  # or "prod-us-east1", "dev-us-east1", etc.
+
+Because this YAML sits under addons/gatekeeper/, Fleet will apply it as part of the same GitRepo. That’s how your core repo decides to sync the policies repo, and it stays logically grouped under the Gatekeeper addon.
+
+⸻
+
+2.3 Sysdig addon – addons/sysdig/fleet.yaml
+
+# cluster-baseline/addons/sysdig/fleet.yaml
+name: sysdig-addon
+defaultNamespace: sysdig-agent
+
+helm:
+  releaseName: sysdig-agent
+  chart: sysdig
+  repo: https://artifactory.mycompany.com/helm/sysdig
+  version: 1.5.0          # <-- set to your real version
+
+  valuesFrom:
+    - configMapKeyRef:
+        name: sysdig-values
+        key: values.yaml
+        optional: true
+
+Same pattern: one Fleet bundle for Sysdig, shared by all clusters.
+
+⸻
+
+3. Per-cluster values (only place that differs)
+
+3.1 PROD cluster: clusters/prod-us-east1/values/…
+
+Gatekeeper values – clusters/prod-us-east1/values/gatekeeper-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-values
+  namespace: gatekeeper-system     # 🔥 must match addon defaultNamespace
+data:
+  values.yaml: |
+    replicaCount: 3
+    audit:
+      enable: true
+      intervalSeconds: 20
+    validatingWebhook:
+      failurePolicy: Ignore
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 200m
+        memory: 256Mi
+
+Sysdig values – clusters/prod-us-east1/values/sysdig-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sysdig-values
+  namespace: sysdig-agent          # 🔥 must match addon defaultNamespace
+data:
+  values.yaml: |
+    agent:
+      apiKey: prod-API-KEY
+      collectorEndpoint: logs.prod.example.com
+      resources:
+        limits:
+          cpu: 300m
+          memory: 512Mi
+        requests:
+          cpu: 100m
+          memory: 256Mi
+
+
+⸻
+
+3.2 DEV cluster: clusters/dev-us-east1/values/…
+
+Gatekeeper values – clusters/dev-us-east1/values/gatekeeper-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-values
+  namespace: gatekeeper-system
+data:
+  values.yaml: |
+    replicaCount: 1
+    audit:
+      enable: true
+      intervalSeconds: 60
+    validatingWebhook:
+      failurePolicy: Ignore
+
+Sysdig values – clusters/dev-us-east1/values/sysdig-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sysdig-values
+  namespace: sysdig-agent
+data:
+  values.yaml: |
+    agent:
+      apiKey: dev-API-KEY
+      collectorEndpoint: logs.dev.example.com
+
+That’s it. No fleet.yaml here; they’re just raw manifests.
+
+⸻
+
+4. GitRepo objects (one per cluster)
+
+These live in the cluster, not in the repo. You can manage them with Terraform or plain YAML.
+
+4.1 PROD cluster GitRepo
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: prod-us-east1-core
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/cluster-baseline.git
+  branch: main
+  paths:
+    - addons                  # shared addon bundles (gatekeeper, sysdig, etc.)
+    - clusters/prod-us-east1  # this cluster's ConfigMap values
+
+4.2 DEV cluster GitRepo
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: dev-us-east1-core
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/cluster-baseline.git
+  branch: main
+  paths:
+    - addons                  # same shared addon bundles
+    - clusters/dev-us-east1   # this cluster's ConfigMap values
+
+You can wrap this in a Terraform module so you only pass cluster_id = "prod-us-east1" and it fills in the paths.
+
+⸻
+
+5. How this behaves at runtime
+
+For each cluster:
+	1.	Fleet syncs cluster-baseline at the given paths.
+	2.	From addons/:
+	•	Creates gatekeeper-addon bundle:
+	•	Installs Gatekeeper Helm chart from Artifactory
+	•	Reads ConfigMap gatekeeper-values from gatekeeper-system (valuesFrom)
+	•	Creates sysdig-addon bundle:
+	•	Installs Sysdig Helm chart from Artifactory
+	•	Reads ConfigMap sysdig-values from sysdig-agent
+	•	Applies GitRepo gatekeeper-policies (so policies repo gets synced).
+	3.	From clusters/<cluster>/values/:
+	•	Creates a separate “raw YAML” bundle that just applies those ConfigMaps.
+
+If ConfigMaps appear slightly after the first Helm render, optional: true prevents hard failures; Fleet will reconcile again and merge them in once they exist.
+
+⸻
+
+If you want, next step we can do is:
+	•	add a third addon (e.g., metrics-server) to this same repo, using the exact same pattern,
+	•	or wire in per-cluster path selection for the policies repo (e.g. policies/prod/, policies/dev/) via separate GitRepo manifests under addons/gatekeeper/.
