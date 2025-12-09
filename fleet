@@ -1,0 +1,387 @@
+Here’s a single, consolidated “report” you can copy from. I’ll keep text minimal and focus on structure + YAML.
+
+⸻
+
+0. Assumptions
+	•	Leaf / single-cluster Fleet (namespace: fleet-local)
+	•	Repo cluster-baseline = cluster baseline + addons
+	•	Charts (Gatekeeper, Sysdig, etc.) live in Artifactory Helm repo
+	•	Policies live in separate repo: gatekeeper-policies
+	•	You want:
+	•	Per-addon fleet.yaml (addon definitions)
+	•	Per-cluster overrides in clusters/...
+	•	Ability to choose which addons each cluster gets (via GitRepo.paths)
+	•	Gatekeeper policies from another repo
+
+⸻
+
+1. Repo: cluster-baseline
+
+1.1 Directory layout
+
+cluster-baseline/
+  addons/
+    gatekeeper/
+      fleet.yaml
+    sysdig/
+      fleet.yaml
+
+  clusters/
+    prod/
+      us-east1/
+        fleet.yaml
+        kustomization.yaml
+        values/
+          gatekeeper-values.yaml
+          sysdig-values.yaml
+
+    dev/
+      us-east1/
+        fleet.yaml
+        kustomization.yaml
+        values/
+          gatekeeper-values.yaml
+          sysdig-values.yaml
+
+You can add more addons in addons/ and more clusters in clusters/.
+
+⸻
+
+1.2 Addon: Gatekeeper (Artifactory Helm chart)
+
+Path: cluster-baseline/addons/gatekeeper/fleet.yaml
+
+name: gatekeeper-addon
+defaultNamespace: gatekeeper-system
+
+helm:
+  releaseName: gatekeeper
+
+  # Artifactory Helm repo
+  chart: gatekeeper                  # chart name in Artifactory
+  repo: https://artifactory.mycompany.com/helm/gatekeeper
+  version: 3.13.0                    # example, use your version
+
+  # Pull values from a ConfigMap created by the cluster bundle
+  valuesFrom:
+    - kind: ConfigMap
+      name: gatekeeper-values
+      optional: true
+
+
+⸻
+
+1.3 Addon: Sysdig (Artifactory Helm chart)
+
+Path: cluster-baseline/addons/sysdig/fleet.yaml
+
+name: sysdig-addon
+defaultNamespace: sysdig-agent
+
+helm:
+  releaseName: sysdig-agent
+
+  chart: sysdig
+  repo: https://artifactory.mycompany.com/helm/sysdig
+  version: 1.5.0                     # example
+
+  valuesFrom:
+    - kind: ConfigMap
+      name: sysdig-values
+      optional: true
+
+
+⸻
+
+1.4 Cluster: prod/us-east1 bundle
+
+This bundle:
+	•	Creates per-cluster ConfigMaps with Helm values (for Gatekeeper, Sysdig, etc.)
+	•	Does not know about charts directly; it just supplies values
+
+1.4.1 cluster-baseline/clusters/prod/us-east1/fleet.yaml
+
+name: cluster-prod-us-east1
+defaultNamespace: fleet-local
+
+kustomize:
+  dir: .
+
+1.4.2 cluster-baseline/clusters/prod/us-east1/kustomization.yaml
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - values/gatekeeper-values.yaml
+  - values/sysdig-values.yaml
+
+1.4.3 cluster-baseline/clusters/prod/us-east1/values/gatekeeper-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-values
+  namespace: gatekeeper-system
+data:
+  values.yaml: |
+    replicaCount: 3
+    audit:
+      enable: true
+      intervalSeconds: 20
+    validatingWebhook:
+      failurePolicy: Ignore
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 200m
+        memory: 256Mi
+
+1.4.4 cluster-baseline/clusters/prod/us-east1/values/sysdig-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sysdig-values
+  namespace: sysdig-agent
+data:
+  values.yaml: |
+    agent:
+      apiKey: prod-API-KEY
+      collectorEndpoint: logs.prod.example.com
+      resources:
+        limits:
+          cpu: 300m
+          memory: 512Mi
+        requests:
+          cpu: 100m
+          memory: 256Mi
+
+
+⸻
+
+1.5 Cluster: dev/us-east1 (just different values)
+
+cluster-baseline/clusters/dev/us-east1/fleet.yaml
+
+name: cluster-dev-us-east1
+defaultNamespace: fleet-local
+
+kustomize:
+  dir: .
+
+cluster-baseline/clusters/dev/us-east1/kustomization.yaml
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - values/gatekeeper-values.yaml
+  - values/sysdig-values.yaml
+
+cluster-baseline/clusters/dev/us-east1/values/gatekeeper-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-values
+  namespace: gatekeeper-system
+data:
+  values.yaml: |
+    replicaCount: 1
+    audit:
+      enable: true
+      intervalSeconds: 60
+    validatingWebhook:
+      failurePolicy: Ignore
+
+cluster-baseline/clusters/dev/us-east1/values/sysdig-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sysdig-values
+  namespace: sysdig-agent
+data:
+  values.yaml: |
+    agent:
+      apiKey: dev-API-KEY
+      collectorEndpoint: logs.dev.example.com
+
+
+⸻
+
+2. Repo: gatekeeper-policies
+
+Separate repo with ConstraintTemplates + Constraints.
+
+2.1 Directory layout
+
+gatekeeper-policies/
+  templates/
+    k8srequiredlabels-template.yaml
+  constraints/
+    k8srequiredlabels-namespace.yaml
+  fleet.yaml
+
+
+⸻
+
+2.2 Example ConstraintTemplate
+
+gatekeeper-policies/templates/k8srequiredlabels-template.yaml
+
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+
+        violation[{"msg": msg}] {
+          provided := {key | input.review.object.metadata.labels[key]}
+          required := {"owner", "team"}
+          missing := required - provided
+          count(missing) > 0
+          msg := sprintf("Missing required labels: %v", [missing])
+
+
+⸻
+
+2.3 Example Constraint
+
+gatekeeper-policies/constraints/k8srequiredlabels-namespace.yaml
+
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: ns-must-have-labels
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Namespace"]
+  parameters:
+    labels:
+      - key: owner
+      - key: team
+
+
+⸻
+
+2.4 Policies repo Fleet bundle
+
+gatekeeper-policies/fleet.yaml
+
+name: gatekeeper-policies
+defaultNamespace: gatekeeper-system
+
+kustomize:
+  dir: .
+
+This bundle just applies CTs + Constraints into gatekeeper-system.
+
+⸻
+
+3. GitRepo CRs (in Rancher / Fleet)
+
+You’ll create two GitRepo resources in the leaf cluster (namespace fleet-local).
+
+3.1 GitRepo for cluster-baseline (per cluster)
+
+Prod us-east1 example:
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: prod-us-east1-baseline
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/cluster-baseline.git
+  branch: main
+  # IMPORTANT: this controls which addons this cluster gets
+  paths:
+    - addons/gatekeeper
+    - addons/sysdig
+    - clusters/prod/us-east1
+
+Dev us-east1 example:
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: dev-us-east1-baseline
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/cluster-baseline.git
+  branch: main
+  paths:
+    - addons/gatekeeper
+    - addons/sysdig
+    - clusters/dev/us-east1
+
+For another cluster, you just create another GitRepo with:
+	•	the same addons/... paths
+	•	a different clusters/<env>/<region> path
+
+⸻
+
+3.2 GitRepo for gatekeeper-policies
+
+This is shared across clusters (or you can scope it).
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: gatekeeper-policies
+  namespace: fleet-local
+spec:
+  repo: https://git.example.com/gatekeeper-policies.git
+  branch: main
+  paths:
+    - .   # or "templates", "constraints" if you like
+
+Fleet will create a bundle named gatekeeper-policies (from fleet.yaml).
+
+You can also add dependsOn in policies if you want them to wait for Gatekeeper:
+
+gatekeeper-policies/fleet.yaml (optional dependency):
+
+name: gatekeeper-policies
+defaultNamespace: gatekeeper-system
+dependsOn:
+  - name: gatekeeper-addon
+
+kustomize:
+  dir: .
+
+
+⸻
+
+4. Execution Summary
+
+For each leaf cluster:
+	1.	GitRepo: prod-us-east1-baseline:
+	•	Bundle cluster-prod-us-east1 → creates ConfigMaps with Helm values
+	•	Bundle gatekeeper-addon → installs Gatekeeper Helm chart from Artifactory, reading gatekeeper-values ConfigMap
+	•	Bundle sysdig-addon → installs Sysdig Helm chart from Artifactory, reading sysdig-values ConfigMap
+	2.	GitRepo: gatekeeper-policies:
+	•	Bundle gatekeeper-policies → applies CTs + Constraints.
+
+You can now:
+	•	Add more addons by dropping more folders under addons/ with their own fleet.yaml.
+	•	Decide which addons each cluster gets by adjusting paths: in that cluster’s GitRepo.
+	•	Override values per cluster by editing clusters/<env>/<region>/values/*.yaml.
+
+⸻
+
+If you want, next step I can do is add one more addon (e.g., metrics-server) using the exact same pattern so you have a pure template for “add addon N”.
