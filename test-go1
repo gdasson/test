@@ -2,12 +2,35 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
 func main() {
-	// Intentionally empty.
-	// This challenge is graded using unit tests (go test).
+	// ==========================================================
+	// SELF-CHECK HARNESS (you can run this anytime)
+	// Add more cases below as you like.
+	// Your final score is based on hidden unit tests.
+	// ==========================================================
+
+	fmt.Println("Q1: ParseNamespacedName self-check\n")
+
+	// Example 1
+	checkParse("apps/nginx", "apps", "nginx", false)
+
+	// Example 2
+	checkParse("kube-system/coredns", "kube-system", "coredns", false)
+
+	// Example 3 (invalid)
+	checkParse("apps/", "", "", true)
+
+	// Example 4 (invalid)
+	checkParse("/nginx", "", "", true)
+
+	// Example 5 (invalid)
+	checkParse("apps/nginx/extra", "", "", true)
+
+	fmt.Println("\nDone.")
 }
 
 /*
@@ -26,32 +49,41 @@ Validation rules (DNS label-like):
   - only lowercase letters a-z, digits 0-9, and '-'
   - must start and end with [a-z0-9]
 
-Examples:
-1) "apps/nginx"
-   => namespace="apps", name="nginx", err=nil
-
-2) "kube-system/coredns"
-   => namespace="kube-system", name="coredns", err=nil
-
-3) "apps/"
-   => err != nil
-
-4) "/nginx"
-   => err != nil
-
-5) "apps/nginx/extra"
-   => err != nil
-
-Notes:
-- You MUST NOT change the function signature.
-- You may add helper functions below.
+You MUST NOT change the function signature.
+You may add helper functions below.
 ==========================================================
 */
 
 // TODO: Implement this function.
 func ParseNamespacedName(s string) (namespace string, name string, err error) {
-	_ = strings.TrimSpace(s)
+	// Tip: strings.TrimSpace can help.
+	s = strings.TrimSpace(s)
+	_ = s
 	return "", "", errors.New("not implemented")
 }
 
-// You may add helper functions below (optional).
+// --------------------
+// Self-check helpers
+// --------------------
+
+func checkParse(input, wantNS, wantName string, wantErr bool) {
+	ns, name, err := ParseNamespacedName(input)
+	gotErr := err != nil
+
+	pass := true
+	if gotErr != wantErr {
+		pass = false
+	}
+	if !wantErr {
+		if ns != wantNS || name != wantName {
+			pass = false
+		}
+	}
+
+	if pass {
+		fmt.Printf("PASS  input=%q => ns=%q name=%q err=%v\n", input, ns, name, err)
+	} else {
+		fmt.Printf("FAIL  input=%q => ns=%q name=%q err=%v (wanted ns=%q name=%q err=%v)\n",
+			input, ns, name, err, wantNS, wantName, wantErr)
+	}
+}
