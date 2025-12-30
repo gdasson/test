@@ -1,0 +1,57 @@
+package main
+
+import (
+	"errors"
+	"strings"
+)
+
+func main() {
+	// Intentionally empty.
+	// This challenge is graded using unit tests (go test).
+}
+
+/*
+==========================================================
+Q1: K8s NamespacedName Parser
+==========================================================
+
+Implement ParseNamespacedName(s).
+
+A NamespacedName is "namespace/name".
+
+Validation rules (DNS label-like):
+- Exactly one '/' separating namespace and name
+- Each part:
+  - length 1..63
+  - only lowercase letters a-z, digits 0-9, and '-'
+  - must start and end with [a-z0-9]
+
+Examples:
+1) "apps/nginx"
+   => namespace="apps", name="nginx", err=nil
+
+2) "kube-system/coredns"
+   => namespace="kube-system", name="coredns", err=nil
+
+3) "apps/"
+   => err != nil
+
+4) "/nginx"
+   => err != nil
+
+5) "apps/nginx/extra"
+   => err != nil
+
+Notes:
+- You MUST NOT change the function signature.
+- You may add helper functions below.
+==========================================================
+*/
+
+// TODO: Implement this function.
+func ParseNamespacedName(s string) (namespace string, name string, err error) {
+	_ = strings.TrimSpace(s)
+	return "", "", errors.New("not implemented")
+}
+
+// You may add helper functions below (optional).
