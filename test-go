@@ -1,0 +1,529 @@
+Below is a complete 3-challenge Go unit-test pack you can paste into Coderbyte → Custom Library → Challenges → Unit Tests (Go).
+
+Why unit tests: Coderbyte’s Input/Output custom challenges only support primitive types (string/number/bool/flat arrays). For K8s-real problems with richer structures, they recommend a Unit Test challenge, and you can hide test files from candidates.  ￼
+
+⸻
+
+Challenge 1 (Easy, ~8–10 min)
+
+Title
+
+K8s NamespacedName Parser
+
+Candidate instructions (paste into “Instructions”)
+
+Implement:
+
+func ParseNamespacedName(s string) (namespace string, name string, err error)
+
+Rules:
+	•	Input must be exactly namespace/name with one /
+	•	namespace and name must each be a valid DNS label:
+	•	length 1..63
+	•	lowercase letters a-z, digits 0-9, and -
+	•	must start and end with alphanumeric
+	•	Return a non-nil error on invalid input.
+
+You may add helpers, but do not change function signature.
+
+File tree
+
+Create these files:
+
+main.go (candidate edits)
+
+package main
+
+import (
+	"errors"
+	"strings"
+)
+
+func main() {}
+
+// ParseNamespacedName parses "namespace/name" and validates that both parts are DNS labels.
+// DNS label rules for this challenge:
+// - 1..63 chars
+// - lowercase [a-z0-9-]
+// - must start/end with [a-z0-9]
+func ParseNamespacedName(s string) (namespace string, name string, err error) {
+	s = strings.TrimSpace(s)
+
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		return "", "", errors.New("invalid namespaced name")
+	}
+
+	ns := parts[0]
+	nm := parts[1]
+	if !isDNSLabel(ns) || !isDNSLabel(nm) {
+		return "", "", errors.New("invalid namespaced name")
+	}
+	return ns, nm, nil
+}
+
+func isDNSLabel(x string) bool {
+	if len(x) < 1 || len(x) > 63 {
+		return false
+	}
+	// must start/end with alnum
+	if !isLowerAlnum(x[0]) || !isLowerAlnum(x[len(x)-1]) {
+		return false
+	}
+	for i := 0; i < len(x); i++ {
+		c := x[i]
+		if isLowerAlnum(c) || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isLowerAlnum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+}
+
+sample_test.go (visible, read-only)
+
+package main
+
+import "testing"
+
+func TestParseNamespacedName_Simple(t *testing.T) {
+	ns, name, err := ParseNamespacedName("apps/nginx")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ns != "apps" || name != "nginx" {
+		t.Fatalf("got %q/%q", ns, name)
+	}
+}
+
+hidden_test.go (HIDDEN)
+
+package main
+
+import "testing"
+
+func TestParseNamespacedName_InvalidFormats(t *testing.T) {
+	cases := []string{
+		"", "apps", "apps/", "/nginx", "apps/nginx/extra",
+		" Apps/nginx ", // whitespace + uppercase
+		"apps/NgInx",
+	}
+	for _, in := range cases {
+		_, _, err := ParseNamespacedName(in)
+		if err == nil {
+			t.Fatalf("expected error for %q", in)
+		}
+	}
+}
+
+func TestParseNamespacedName_InvalidDNSLabel(t *testing.T) {
+	cases := []string{
+		"-apps/nginx",
+		"apps/-nginx",
+		"apps/nginx-",
+		"ap_ps/nginx",
+		"apps/ngin$x",
+		"apps/NGINX",
+	}
+	for _, in := range cases {
+		_, _, err := ParseNamespacedName(in)
+		if err == nil {
+			t.Fatalf("expected error for %q", in)
+		}
+	}
+}
+
+func TestParseNamespacedName_Length(t *testing.T) {
+	// 63-char label is valid
+	ok63 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 63 a's
+	_, _, err := ParseNamespacedName(ok63 + "/nginx")
+	if err != nil {
+		t.Fatalf("expected valid for 63-char namespace: %v", err)
+	}
+
+	// 64-char label invalid
+	bad64 := ok63 + "a"
+	_, _, err = ParseNamespacedName(bad64 + "/nginx")
+	if err == nil {
+		t.Fatalf("expected error for 64-char namespace")
+	}
+}
+
+
+⸻
+
+Challenge 2 (Medium, ~15 min)
+
+Title
+
+K8s LabelSelector Matcher
+
+Candidate instructions
+
+Implement:
+
+func MatchesSelector(labels map[string]string, sel LabelSelector) bool
+
+Semantics (Kubernetes-like):
+	•	MatchLabels: all key/value pairs must match exactly.
+	•	MatchExpressions supports operators:
+	•	In: key must exist and value must be in Values
+	•	NotIn: matches if key is missing OR value not in Values
+	•	Exists: key must exist
+	•	DoesNotExist: key must be missing
+	•	Unknown operator => return false.
+
+Return true only if all requirements match.
+
+File tree
+
+main.go (candidate edits)
+
+package main
+
+func main() {}
+
+type LabelSelector struct {
+	MatchLabels      map[string]string
+	MatchExpressions []LabelSelectorRequirement
+}
+
+type LabelSelectorRequirement struct {
+	Key      string
+	Operator string // In, NotIn, Exists, DoesNotExist
+	Values   []string
+}
+
+func MatchesSelector(labels map[string]string, sel LabelSelector) bool {
+	// MatchLabels
+	for k, want := range sel.MatchLabels {
+		got, ok := labels[k]
+		if !ok || got != want {
+			return false
+		}
+	}
+
+	// MatchExpressions
+	for _, req := range sel.MatchExpressions {
+		switch req.Operator {
+		case "In":
+			v, ok := labels[req.Key]
+			if !ok || !contains(req.Values, v) {
+				return false
+			}
+		case "NotIn":
+			v, ok := labels[req.Key]
+			if ok && contains(req.Values, v) {
+				return false
+			}
+		case "Exists":
+			if _, ok := labels[req.Key]; !ok {
+				return false
+			}
+		case "DoesNotExist":
+			if _, ok := labels[req.Key]; ok {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
+func contains(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+sample_test.go (visible, read-only)
+
+package main
+
+import "testing"
+
+func TestMatchesSelector_Basic(t *testing.T) {
+	labels := map[string]string{"app": "nginx", "env": "prod"}
+
+	sel := LabelSelector{
+		MatchLabels: map[string]string{"app": "nginx"},
+		MatchExpressions: []LabelSelectorRequirement{
+			{Key: "env", Operator: "In", Values: []string{"prod", "stage"}},
+		},
+	}
+
+	if !MatchesSelector(labels, sel) {
+		t.Fatalf("expected match")
+	}
+}
+
+hidden_test.go (HIDDEN)
+
+package main
+
+import "testing"
+
+func TestMatchesSelector_NotIn_MissingKeyMatches(t *testing.T) {
+	labels := map[string]string{"app": "nginx"}
+	sel := LabelSelector{
+		MatchExpressions: []LabelSelectorRequirement{
+			{Key: "env", Operator: "NotIn", Values: []string{"prod"}},
+		},
+	}
+	if !MatchesSelector(labels, sel) {
+		t.Fatalf("expected match when key missing for NotIn")
+	}
+}
+
+func TestMatchesSelector_Exists_DoesNotExist(t *testing.T) {
+	labels := map[string]string{"a": "1"}
+
+	if !MatchesSelector(labels, LabelSelector{
+		MatchExpressions: []LabelSelectorRequirement{{Key: "a", Operator: "Exists"}},
+	}) {
+		t.Fatalf("expected Exists match")
+	}
+
+	if MatchesSelector(labels, LabelSelector{
+		MatchExpressions: []LabelSelectorRequirement{{Key: "a", Operator: "DoesNotExist"}},
+	}) {
+		t.Fatalf("expected DoesNotExist to fail")
+	}
+}
+
+func TestMatchesSelector_AllMustMatch(t *testing.T) {
+	labels := map[string]string{"app": "nginx", "env": "prod", "track": "stable"}
+	sel := LabelSelector{
+		MatchLabels: map[string]string{"app": "nginx"},
+		MatchExpressions: []LabelSelectorRequirement{
+			{Key: "env", Operator: "In", Values: []string{"prod"}},
+			{Key: "track", Operator: "Exists"},
+			{Key: "tier", Operator: "DoesNotExist"},
+		},
+	}
+	if !MatchesSelector(labels, sel) {
+		t.Fatalf("expected match")
+	}
+}
+
+func TestMatchesSelector_UnknownOperatorFalse(t *testing.T) {
+	labels := map[string]string{"a": "1"}
+	sel := LabelSelector{
+		MatchExpressions: []LabelSelectorRequirement{{Key: "a", Operator: "Gt", Values: []string{"1"}}},
+	}
+	if MatchesSelector(labels, sel) {
+		t.Fatalf("expected false for unknown operator")
+	}
+}
+
+
+⸻
+
+Challenge 3 (Medium, ~18–20 min)
+
+Title
+
+K8s Controller Workqueue Simulator (Coalescing + Retries)
+
+Candidate instructions
+
+Implement:
+
+func SimulateWorkQueue(events []string, failures map[string]int, maxAttempts int) (status map[string]string, attempts map[string]int)
+
+This simulates a Kubernetes-style reconcile queue:
+	•	Start with an empty FIFO queue.
+	•	For each string in events (a “key” like namespace/name):
+	•	enqueue it only if it is not already enqueued and not already terminal (succeeded/failed).
+	•	Then process the queue until empty:
+	•	pop front key k
+	•	attempts[k]++
+	•	A reconcile attempt fails while attempts[k] <= failures[k]
+	•	Example: failures["apps/a"]=2 means attempts 1 and 2 fail, attempt 3 succeeds.
+	•	If attempt failed:
+	•	if attempts[k] < maxAttempts, re-enqueue k (at back)
+	•	else mark status[k] = "failed" (terminal)
+	•	If attempt succeeded: mark status[k] = "success" (terminal)
+	•	Only keys that appear in events should show up in output maps.
+	•	If maxAttempts <= 0, treat it as 1.
+
+File tree
+
+main.go (candidate edits)
+
+package main
+
+func main() {}
+
+// SimulateWorkQueue simulates a coalescing workqueue with retries.
+//
+// failures[k] = number of failures before the first success.
+// maxAttempts = maximum total attempts allowed for a key (including the final success attempt).
+func SimulateWorkQueue(events []string, failures map[string]int, maxAttempts int) (status map[string]string, attempts map[string]int) {
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+
+	status = make(map[string]string)
+	attempts = make(map[string]int)
+
+	// Track which keys were ever seen (to restrict output).
+	seen := make(map[string]bool)
+
+	// Coalescing queue bookkeeping.
+	var q []string
+	enqueued := make(map[string]bool)
+
+	enqueue := func(k string) {
+		if status[k] != "" { // terminal already
+			return
+		}
+		if enqueued[k] {
+			return
+		}
+		enqueued[k] = true
+		q = append(q, k)
+	}
+
+	for _, k := range events {
+		seen[k] = true
+		enqueue(k)
+	}
+
+	for len(q) > 0 {
+		k := q[0]
+		q = q[1:]
+		enqueued[k] = false
+
+		attempts[k]++
+
+		failBeforeSuccess := failures[k]
+		failed := attempts[k] <= failBeforeSuccess
+
+		if failed {
+			if attempts[k] < maxAttempts {
+				enqueue(k)
+			} else {
+				status[k] = "failed"
+			}
+			continue
+		}
+
+		status[k] = "success"
+	}
+
+	// Ensure only keys from events appear (seen), even if maps had other keys.
+	// (We never add other keys, but keep this defensive.)
+	for k := range status {
+		if !seen[k] {
+			delete(status, k)
+		}
+	}
+	for k := range attempts {
+		if !seen[k] {
+			delete(attempts, k)
+		}
+	}
+
+	return status, attempts
+}
+
+sample_test.go (visible, read-only)
+
+package main
+
+import "testing"
+
+func TestSimulateWorkQueue_Basic(t *testing.T) {
+	events := []string{"apps/a", "apps/a", "apps/b"}
+	failures := map[string]int{"apps/a": 1} // fail once then succeed
+	status, attempts := SimulateWorkQueue(events, failures, 3)
+
+	if status["apps/a"] != "success" || attempts["apps/a"] != 2 {
+		t.Fatalf("apps/a got status=%q attempts=%d", status["apps/a"], attempts["apps/a"])
+	}
+	if status["apps/b"] != "success" || attempts["apps/b"] != 1 {
+		t.Fatalf("apps/b got status=%q attempts=%d", status["apps/b"], attempts["apps/b"])
+	}
+}
+
+hidden_test.go (HIDDEN)
+
+package main
+
+import "testing"
+
+func TestSimulateWorkQueue_FailsOut(t *testing.T) {
+	events := []string{"ns/x"}
+	failures := map[string]int{"ns/x": 10} // will never succeed within maxAttempts
+	status, attempts := SimulateWorkQueue(events, failures, 3)
+
+	if status["ns/x"] != "failed" {
+		t.Fatalf("expected failed, got %q", status["ns/x"])
+	}
+	if attempts["ns/x"] != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts["ns/x"])
+	}
+}
+
+func TestSimulateWorkQueue_Coalesces(t *testing.T) {
+	events := []string{"ns/a", "ns/a", "ns/a", "ns/b", "ns/b"}
+	status, attempts := SimulateWorkQueue(events, map[string]int{}, 2)
+
+	if status["ns/a"] != "success" || attempts["ns/a"] != 1 {
+		t.Fatalf("ns/a expected 1 attempt success, got %v %v", status["ns/a"], attempts["ns/a"])
+	}
+	if status["ns/b"] != "success" || attempts["ns/b"] != 1 {
+		t.Fatalf("ns/b expected 1 attempt success, got %v %v", status["ns/b"], attempts["ns/b"])
+	}
+}
+
+func TestSimulateWorkQueue_RetryThenSuccess(t *testing.T) {
+	events := []string{"ns/a", "ns/b"}
+	failures := map[string]int{"ns/a": 2, "ns/b": 1}
+	status, attempts := SimulateWorkQueue(events, failures, 5)
+
+	if status["ns/a"] != "success" || attempts["ns/a"] != 3 {
+		t.Fatalf("ns/a expected success on 3, got status=%q attempts=%d", status["ns/a"], attempts["ns/a"])
+	}
+	if status["ns/b"] != "success" || attempts["ns/b"] != 2 {
+		t.Fatalf("ns/b expected success on 2, got status=%q attempts=%d", status["ns/b"], attempts["ns/b"])
+	}
+}
+
+func TestSimulateWorkQueue_MaxAttemptsDefault(t *testing.T) {
+	events := []string{"ns/a"}
+	failures := map[string]int{"ns/a": 1}
+	status, attempts := SimulateWorkQueue(events, failures, 0) // treated as 1
+
+	if status["ns/a"] != "failed" || attempts["ns/a"] != 1 {
+		t.Fatalf("expected failed with 1 attempt, got status=%q attempts=%d", status["ns/a"], attempts["ns/a"])
+	}
+}
+
+
+⸻
+
+How to set this up in Coderbyte (quick)
+
+For each of the 3:
+	1.	Custom Library → Challenges → Unit Tests → Create
+	2.	Select Go unit tests
+	3.	Add the files exactly as shown
+	4.	Mark:
+	•	sample_test.go as read-only (optional)
+	•	hidden_test.go as hidden
+	5.	Put all three challenges into one assessment and set overall time to 45 minutes
+
+Coderbyte supports hiding files in unit test challenges.  ￼
+
+If you want, I can also tailor the scoring (e.g., Q1 pass/fail, Q2 weighted heavier, Q3 partial credit) by expanding the hidden tests to produce more granular pass counts.
